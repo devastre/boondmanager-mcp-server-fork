@@ -608,6 +608,8 @@ npx boondmanager-mcp-server
 | `MCP_HTTP_SESSION_TTL_MS` | `1800000` (30 min) | En mode stateful, duree d'inactivite au-dela de laquelle une session est fermee. |
 | `MCP_HTTP_SESSION_SWEEP_INTERVAL_MS` | `300000` (5 min) | Frequence de balayage des sessions inactives. |
 | `MCP_HTTP_ALLOWED_HOSTS` | _(auto)_ | Liste blanche du header `Host` (anti DNS rebinding, CVE-2025-66414). `*` pour desactiver explicitement. |
+| `BOOND_HTTP_STATIC_AUTH` | `false` | Activer le mode d'authentification statique (fournir les identifiants Boond via les variables d'environnement). |
+| `BOOND_HTTP_HYBRID_AUTH` | `false` | Activer le mode d'authentification hybride (USER_TOKEN côté client par requête via X-Boond-User-Token, CLIENT_TOKEN+CLIENT_KEY côté serveur). Ignoré si `BOOND_HTTP_STATIC_AUTH` est actif. |
 
 **Variables OAuth2 — discovery (toutes optionnelles)**
 

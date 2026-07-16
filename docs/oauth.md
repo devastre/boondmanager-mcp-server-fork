@@ -195,21 +195,109 @@ server that an attacker could steal by reaching the listener.
 
 ## 6. Implementation notes
 
-- **`src/services/oauth.ts`** — minimal: `oauthContext` (AsyncLocalStorage),
+- **`src/services/oauth.ts`** — `oauthContext` + `hybridContext` (two
+  independent `AsyncLocalStorage` instances so the modes can't interfere),
   `extractBearerToken`, `buildProtectedResourceMetadata`,
-  `resolveAuthorizationServer`, `resolveAdvertisedScopes`.
-- **`src/transports/http.ts`** — extracts the Bearer token before
-  dispatching to the SDK's `StreamableHTTPServerTransport`, wraps the
-  handler in `oauthContext.run({ accessToken }, …)`, serves the public
-  discovery endpoint, returns RFC 6750 §3.1 challenges on missing/invalid
-  tokens.
-- **`src/services/boond-client.ts`** — `oauthContextAuth` is the
-  `BoondAuthProvider` registered by the HTTP bootstrap. It reads the
-  context per-call and forwards `Authorization: Bearer <token>` to Boond.
-- **No state** is persisted server-side. The container has nothing to
-  back up, nothing to rotate, nothing to encrypt at rest.
-- Tests: `src/services/oauth.test.ts` (context propagation, header
-  parsing, metadata builder), `src/transports/http.test.ts` (401 +
-  WWW-Authenticate, discovery endpoint, both metadata variants,
-  authorization-server override), `src/services/boond-client.test.ts`
-  (concurrent multi-tenant Bearer isolation via `oauthContextAuth`).
+  `resolveAuthorizationServer`, `resolveAdvertisedScopes`,
+  `HYBRID_USER_TOKEN_HEADER`.
+- **`src/transports/http.ts`** — tripartite dispatch: `staticAuth →
+  hybridAuth → OAuth Bearer`. In hybrid mode, reads `X-Boond-User-Token`
+  and wraps the handler in `hybridContext.run({ userToken }, …)`. OAuth
+  discovery endpoint is hidden in both `staticAuth` and `hybridAuth` modes.
+- **`src/services/boond-client.ts`** — `oauthContextAuth` (OAuth Bearer
+  path) and `hybridContextAuth` (hybrid path). `hybridContextAuth` reads the
+  `userToken` from `hybridContext`, reads `BOOND_CLIENT_TOKEN` and
+  `BOOND_CLIENT_KEY` from env, and calls `buildJwt()` to mint a fresh HS256
+  JWT per request.
+- **No user secret** is persisted server-side. `BOOND_USER_TOKEN` is never
+  stored in the server environment in hybrid mode — it travels per-request.
+- Tests: `src/services/oauth.test.ts`, `src/transports/http.test.ts` (hybrid
+  accept/reject, no discovery, context isolation),
+  `src/services/boond-client.test.ts` (`hybridContextAuth` header, payload,
+  errors, concurrent isolation, TTL, `hasHybridEnvCredentials`).
+
+---
+
+## 7. Mode hybride client/serveur (`BOOND_HTTP_HYBRID_AUTH`)
+
+### Quand l'utiliser
+
+| Critère | OAuth Bearer | Statique | **Hybride** |
+|---|---|---|---|
+| Secrets côté serveur | aucun | USER_TOKEN + CLIENT_TOKEN + CLIENT_KEY | CLIENT_TOKEN + CLIENT_KEY seulement |
+| Secrets côté client | access_token OAuth | aucun | **USER_TOKEN** |
+| Multi-tenant | ✅ (chaque user son token) | ❌ (credentials partagés) | ✅ (USER_TOKEN par requête) |
+| OAuth dance requise | ✅ | ❌ | ❌ |
+| Audit Boond | par user Boond | compte de service unique | **par user Boond** |
+| Idéal pour | Clients MCP interactifs | CI/CD, pipelines mono-user | Intégrations où le client gère le USER_TOKEN |
+
+### Flux
+
+```
+MCP client                              MCP server                   BoondManager API
+──────────                              ──────────                   ────────────────
+POST /mcp
+  X-Boond-User-Token: <userToken>  ──►  lit BOOND_CLIENT_TOKEN (env)
+                                        lit BOOND_CLIENT_KEY (env)
+                                        buildJwt(userToken, clientToken, clientKey)
+                                        ──►  X-Jwt-Client-Boondmanager: <jwt>
+                                                                     ◄── réponse JSON:API
+  ◄── réponse MCP
+```
+
+### Configuration serveur
+
+```bash
+export MCP_TRANSPORT=http
+export BOOND_HTTP_HYBRID_AUTH=true    # active le mode hybride
+export BOOND_CLIENT_TOKEN="..."       # secret serveur — ne pas exposer au client
+export BOOND_CLIENT_KEY="..."         # secret serveur — ne pas exposer au client
+# Optionnel : TTL JWT (recommandé pour limiter la fenêtre de rejeu)
+export BOOND_JWT_TTL_SECONDS=3600
+npx boondmanager-mcp-server
+```
+
+Variables d'environnement serveur :
+
+| Variable | Obligatoire | Description |
+|---|---|---|
+| `BOOND_HTTP_HYBRID_AUTH` | ✅ | `true` / `1` / `yes` pour activer |
+| `BOOND_CLIENT_TOKEN` | ✅ | Token client BoondManager (resté côté serveur) |
+| `BOOND_CLIENT_KEY` | ✅ | Clé HMAC BoondManager (resté côté serveur) |
+| `BOOND_JWT_TTL_SECONDS` | — | Durée de vie du JWT en secondes (ajoute `iat`/`exp`) |
+| `BOOND_BASE_URL` | — | URL de base de l'API Boond (défaut : `https://ui.boondmanager.com/api`) |
+
+### Configuration client MCP
+
+Le client doit envoyer **`X-Boond-User-Token: <user_token>`** sur chaque requête MCP.
+
+```bash
+# Exemple curl
+curl -X POST https://mcp.example.com/mcp \
+  -H "Content-Type: application/json" \
+  -H "X-Boond-User-Token: <votre_user_token_boondmanager>" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{...}}'
+```
+
+Le `USER_TOKEN` est le token utilisateur BoondManager (celui que l'utilisateur possède et peut stocker localement). Il ne doit **jamais** être envoyé au serveur comme `BOOND_USER_TOKEN` en variable d'environnement — c'est précisément ce que ce mode évite.
+
+### Règle de priorité
+
+Quand plusieurs variables d'activation sont posées simultanément :
+
+```
+BOOND_HTTP_STATIC_AUTH=true  →  mode statique  (priorité 1)
+BOOND_HTTP_HYBRID_AUTH=true  →  mode hybride   (priorité 2)
+aucun des deux               →  mode OAuth     (défaut)
+```
+
+### Troubleshooting
+
+| Symptôme | Cause / fix |
+|---|---|
+| `401` avec `Missing x-boond-user-token header` | Le client n'envoie pas le header `X-Boond-User-Token`. |
+| `500` avec `BOOND_CLIENT_TOKEN and BOOND_CLIENT_KEY must both be set` | Variables manquantes côté serveur. |
+| `422` de Boond sur les appels API | `USER_TOKEN` invalide ou expiré — le client doit renouveler son token. |
+| La discovery OAuth (`/.well-known/…`) retourne `404` | Normal en mode hybride : le endpoint n'est pas exposé pour ne pas induire les clients OAuth en erreur. |
+| `500` avec `No USER_TOKEN in hybrid request context` | Bug dans le transport : `hybridContext.run(…)` n'a pas été appelé avant le dispatch MCP. |
+
