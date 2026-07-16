@@ -1,7 +1,8 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { request as httpRequest } from "node:http";
 import { resolveAllowedHosts, resolveHttpOptions, startHttpTransport, type HttpServerHandle } from "./http.js";
 import { createMcpServer } from "../server.js";
+import { initClientWithAuth, hybridContextAuth, resetClientForTests } from "../services/boond-client.js";
 
 /**
  * Performs a low-level HTTP POST so we can override the Host header (which
@@ -57,6 +58,7 @@ const ENV_KEYS = [
   "BOOND_OAUTH_AUTHORIZATION_SERVER",
   "BOOND_OAUTH_SCOPES",
   "BOOND_HTTP_STATIC_AUTH",
+  "BOOND_HTTP_HYBRID_AUTH",
 ];
 
 /** Shorthand for an authenticated MCP request body (OAuth Bearer required). */
@@ -148,6 +150,24 @@ describe("resolveHttpOptions", () => {
     expect(resolveHttpOptions().staticAuth).toBe(false);
     delete process.env["BOOND_HTTP_STATIC_AUTH"];
     expect(resolveHttpOptions().staticAuth).toBe(false);
+  });
+
+  it("reads BOOND_HTTP_HYBRID_AUTH correctly", () => {
+    process.env["BOOND_HTTP_HYBRID_AUTH"] = "true";
+    expect(resolveHttpOptions().hybridAuth).toBe(true);
+    process.env["BOOND_HTTP_HYBRID_AUTH"] = "1";
+    expect(resolveHttpOptions().hybridAuth).toBe(true);
+    process.env["BOOND_HTTP_HYBRID_AUTH"] = "yes";
+    expect(resolveHttpOptions().hybridAuth).toBe(true);
+    process.env["BOOND_HTTP_HYBRID_AUTH"] = "false";
+    expect(resolveHttpOptions().hybridAuth).toBe(false);
+    delete process.env["BOOND_HTTP_HYBRID_AUTH"];
+    expect(resolveHttpOptions().hybridAuth).toBe(false);
+  });
+
+  it("hybridAuth defaults to false when env var is unset", () => {
+    const opts = resolveHttpOptions();
+    expect(opts.hybridAuth).toBe(false);
   });
 });
 
@@ -613,5 +633,178 @@ describe("startHttpTransport (integration)", () => {
     expect(res.status).toBe(401);
     const challenge = res.headers.get("www-authenticate") ?? "";
     expect(challenge).toContain('resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/mcp"');
+  });
+
+  // ---------------------------------------------------------------------------
+  // Hybrid auth mode
+  // ---------------------------------------------------------------------------
+
+  const HYBRID_INIT_BODY = JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: {
+      protocolVersion: "2025-06-18",
+      capabilities: {},
+      clientInfo: { name: "vitest", version: "1.0.0" },
+    },
+  });
+
+  it("accepts MCP initialize with X-Boond-User-Token in hybridAuth mode", async () => {
+    handle = await startHttpTransport(createMcpServer, {
+      host: "127.0.0.1",
+      port: 34600,
+      path: "/mcp",
+      stateless: true,
+      enableJsonResponse: true,
+      hybridAuth: true,
+    });
+    // Initialize the Boond client for the pre-validation API call
+    initClientWithAuth(hybridContextAuth);
+    // Mock fetch so the current-user pre-validation succeeds, but pass through other requests
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/application/current-user")) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers({ "Content-Type": "application/vnd.api+json" }),
+          json: () => Promise.resolve({ data: { id: "1", type: "application/current-user" } }),
+          text: () => Promise.resolve(""),
+        });
+      }
+      return originalFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    // Provide CLIENT_TOKEN + CLIENT_KEY in env so hybridContextAuth can mint the JWT
+    process.env["BOOND_CLIENT_TOKEN"] = "test-client-token";
+    process.env["BOOND_CLIENT_KEY"] = "test-client-key";
+    try {
+      const res = await fetch(`http://127.0.0.1:${handle.address.port}/mcp`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+          "X-Boond-User-Token": "my-user-token",
+        },
+        body: HYBRID_INIT_BODY,
+      });
+      expect(res.status).toBe(200);
+      const json = (await res.json()) as { result?: { serverInfo?: { name?: string } } };
+      expect(json.result?.serverInfo?.name).toBe("boondmanager-mcp-server");
+    } finally {
+      delete process.env["BOOND_CLIENT_TOKEN"];
+      delete process.env["BOOND_CLIENT_KEY"];
+      vi.unstubAllGlobals();
+      resetClientForTests();
+    }
+  });
+
+  it("rejects MCP request without X-Boond-User-Token in hybridAuth mode with 401", async () => {
+    handle = await startHttpTransport(createMcpServer, {
+      host: "127.0.0.1",
+      port: 34601,
+      path: "/mcp",
+      stateless: true,
+      enableJsonResponse: true,
+      hybridAuth: true,
+    });
+    const res = await fetch(`http://127.0.0.1:${handle.address.port}/mcp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    expect(res.status).toBe(401);
+    const body = (await res.json()) as { error?: { message?: string } };
+    expect(body.error?.message).toMatch(/x-boond-user-token/i);
+  });
+
+  it("does not serve OAuth discovery metadata in hybridAuth mode", async () => {
+    handle = await startHttpTransport(createMcpServer, {
+      host: "127.0.0.1",
+      port: 34602,
+      path: "/mcp",
+      stateless: true,
+      enableJsonResponse: true,
+      hybridAuth: true,
+    });
+    const res = await fetch(`http://127.0.0.1:${handle.address.port}/.well-known/oauth-protected-resource`);
+    // In hybrid mode the discovery endpoint is not served (would confuse OAuth clients).
+    expect(res.status).toBe(404);
+  });
+
+  it("ignores Bearer token and uses X-Boond-User-Token when hybridAuth is true", async () => {
+    handle = await startHttpTransport(createMcpServer, {
+      host: "127.0.0.1",
+      port: 34603,
+      path: "/mcp",
+      stateless: true,
+      enableJsonResponse: true,
+      hybridAuth: true,
+    });
+    initClientWithAuth(hybridContextAuth);
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/application/current-user")) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Headers({ "Content-Type": "application/vnd.api+json" }),
+          json: () => Promise.resolve({ data: { id: "1", type: "application/current-user" } }),
+          text: () => Promise.resolve(""),
+        });
+      }
+      return originalFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    process.env["BOOND_CLIENT_TOKEN"] = "test-client-token";
+    process.env["BOOND_CLIENT_KEY"] = "test-client-key";
+    try {
+      // Send both headers — the hybrid mode should use X-Boond-User-Token and
+      // not complain about the Bearer being present.
+      const res = await fetch(`http://127.0.0.1:${handle.address.port}/mcp`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+          Authorization: "Bearer some-oauth-token",
+          "X-Boond-User-Token": "my-user-token",
+        },
+        body: HYBRID_INIT_BODY,
+      });
+      expect(res.status).toBe(200);
+    } finally {
+      delete process.env["BOOND_CLIENT_TOKEN"];
+      delete process.env["BOOND_CLIENT_KEY"];
+      vi.unstubAllGlobals();
+      resetClientForTests();
+    }
+  });
+
+  it("still requires Bearer token in OAuth mode (hybridAuth: false)", async () => {
+    handle = await startHttpTransport(createMcpServer, {
+      host: "127.0.0.1",
+      port: 34604,
+      path: "/mcp",
+      stateless: true,
+      enableJsonResponse: true,
+      hybridAuth: false,
+    });
+    // Sending only X-Boond-User-Token (no Bearer) should still be rejected
+    const res = await fetch(`http://127.0.0.1:${handle.address.port}/mcp`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Boond-User-Token": "my-user-token",
+      },
+      body: "{}",
+    });
+    expect(res.status).toBe(401);
+    // In OAuth mode the response should have a WWW-Authenticate challenge
+    expect(res.headers.get("www-authenticate")).toMatch(/^Bearer /);
   });
 });

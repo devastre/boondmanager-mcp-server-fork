@@ -14,7 +14,7 @@ import {
 } from "../constants.js";
 import type { BoondAuthProvider, BoondConfig, JsonApiResource, JsonApiResponse, SearchParams } from "../types.js";
 import { TokenBucket } from "./rate-limiter.js";
-import { oauthContext } from "./oauth.js";
+import { oauthContext, hybridContext } from "./oauth.js";
 
 let config: BoondConfig | null = null;
 
@@ -76,6 +76,48 @@ function envOrUndefined(key: string): string | undefined {
 }
 
 export const JWT_HEADER_NAME = "X-Jwt-Client-Boondmanager";
+
+/**
+ * Auth provider for the hybrid client/server HTTP mode.
+ *
+ * - The MCP client supplies a `USER_TOKEN` per request via the
+ *   `X-Boond-User-Token` header (stored in `hybridContext` by the transport).
+ * - `BOOND_CLIENT_TOKEN` and `BOOND_CLIENT_KEY` stay exclusively in the
+ *   server's environment — they are never exposed to the client.
+ * - A fresh HS256 JWT is minted for every request (or every retry) by calling
+ *   `buildJwt(userToken, clientToken, clientKey)` and forwarded to Boond via
+ *   `X-Jwt-Client-Boondmanager`.
+ *
+ * Errors out clearly when:
+ *   - Called outside a hybrid request context (transport forgot to call
+ *     `hybridContext.run(...)`).
+ *   - `BOOND_CLIENT_TOKEN` or `BOOND_CLIENT_KEY` are absent from the env.
+ */
+export const hybridContextAuth: BoondAuthProvider = async () => {
+  const ctx = hybridContext.getStore();
+  if (!ctx) {
+    throw new Error(
+      "No USER_TOKEN in hybrid request context. " +
+        "In BOOND_HTTP_HYBRID_AUTH mode, include `X-Boond-User-Token: <user_token>` on every MCP request."
+    );
+  }
+  const clientToken = envOrUndefined("BOOND_CLIENT_TOKEN");
+  const clientKey = envOrUndefined("BOOND_CLIENT_KEY");
+  if (!clientToken || !clientKey) {
+    throw new Error(
+      "BOOND_CLIENT_TOKEN and BOOND_CLIENT_KEY must both be set in the server environment for BOOND_HTTP_HYBRID_AUTH mode."
+    );
+  }
+  const ttlRaw = envOrUndefined("BOOND_JWT_TTL_SECONDS");
+  const ttlSeconds = ttlRaw ? Number(ttlRaw) : undefined;
+  const jwt = buildJwt(
+    ctx.userToken,
+    clientToken,
+    clientKey,
+    Number.isFinite(ttlSeconds) && ttlSeconds! > 0 ? { expiresInSeconds: ttlSeconds } : undefined
+  );
+  return { name: JWT_HEADER_NAME, value: jwt };
+};
 
 /**
  * Wrap a static header pair in the dynamic AuthProvider contract.
@@ -160,6 +202,16 @@ export function hasEnvCredentials(): boolean {
     envOrUndefined("BOOND_API_TOKEN") ||
     (envOrUndefined("BOOND_USER") && envOrUndefined("BOOND_PASSWORD"))
   );
+}
+
+/**
+ * True when the server-side env credentials required for `BOOND_HTTP_HYBRID_AUTH`
+ * mode are present: `BOOND_CLIENT_TOKEN` and `BOOND_CLIENT_KEY`.
+ * Note: `BOOND_USER_TOKEN` is intentionally NOT checked here — it comes from
+ * the client at request time, not from the server environment.
+ */
+export function hasHybridEnvCredentials(): boolean {
+  return !!(envOrUndefined("BOOND_CLIENT_TOKEN") && envOrUndefined("BOOND_CLIENT_KEY"));
 }
 
 /**

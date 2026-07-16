@@ -36,6 +36,33 @@ export interface OAuthRequestContext {
  */
 export const oauthContext = new AsyncLocalStorage<OAuthRequestContext>();
 
+export interface HybridRequestContext {
+  /**
+   * BoondManager user token provided by the MCP client via the
+   * `X-Boond-User-Token` HTTP header. The server combines this with
+   * `BOOND_CLIENT_TOKEN` + `BOOND_CLIENT_KEY` (env-only) to mint the JWT
+   * sent to the BoondManager API.
+   */
+  userToken: string;
+}
+
+/**
+ * Per-request context for the hybrid client/server auth mode.
+ * Populated by the HTTP transport (reads `X-Boond-User-Token` header) and
+ * consumed by `hybridContextAuth` in boond-client.ts when an API call fires.
+ *
+ * Intentionally a distinct storage from `oauthContext` so the two modes
+ * cannot interfere even if both headers happen to be present on a request.
+ */
+export const hybridContext = new AsyncLocalStorage<HybridRequestContext>();
+
+/**
+ * Name of the HTTP request header the MCP client must send in
+ * `BOOND_HTTP_HYBRID_AUTH` mode. Lower-cased for consistency with Node.js
+ * `IncomingMessage.headers` (which normalises all header names to lower-case).
+ */
+export const HYBRID_USER_TOKEN_HEADER = "x-boond-user-token";
+
 /**
  * Extract a Bearer token from an HTTP `Authorization` header.
  * Returns `null` for missing, malformed, or non-Bearer auth schemes.

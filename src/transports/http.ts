@@ -8,6 +8,8 @@ import { SERVER_VERSION } from "../server.js";
 import {
   buildProtectedResourceMetadata,
   extractBearerToken,
+  hybridContext,
+  HYBRID_USER_TOKEN_HEADER,
   oauthContext,
   resolveAdvertisedScopes,
   resolveAuthorizationServer,
@@ -48,6 +50,15 @@ export interface HttpTransportOptions {
    * Set `BOOND_HTTP_STATIC_AUTH=true` to enable via `resolveHttpOptions()`.
    */
   staticAuth?: boolean;
+  /**
+   * Hybrid client/server auth mode: the MCP client supplies a USER_TOKEN per
+   * request via `X-Boond-User-Token`, while `BOOND_CLIENT_TOKEN` and
+   * `BOOND_CLIENT_KEY` remain exclusively in the server environment.
+   * The server mints the BoondManager HS256 JWT on the fly from these three
+   * values. `staticAuth` takes precedence when both are set.
+   * Set `BOOND_HTTP_HYBRID_AUTH=true` to enable via `resolveHttpOptions()`.
+   */
+  hybridAuth?: boolean;
 }
 
 export interface HttpServerHandle {
@@ -151,6 +162,9 @@ export function resolveHttpOptions(): HttpTransportOptions {
   const staticAuthRaw = (readEnv("BOOND_HTTP_STATIC_AUTH") ?? "").toLowerCase();
   const staticAuth = staticAuthRaw === "true" || staticAuthRaw === "1" || staticAuthRaw === "yes";
 
+  const hybridAuthRaw = (readEnv("BOOND_HTTP_HYBRID_AUTH") ?? "").toLowerCase();
+  const hybridAuth = hybridAuthRaw === "true" || hybridAuthRaw === "1" || hybridAuthRaw === "yes";
+
   return {
     host: readEnv("MCP_HTTP_HOST") ?? "127.0.0.1",
     port,
@@ -163,6 +177,7 @@ export function resolveHttpOptions(): HttpTransportOptions {
     allowedHosts: readAllowedHosts(),
     publicUrl: readEnv("MCP_HTTP_PUBLIC_URL"),
     staticAuth,
+    hybridAuth,
   };
 }
 
@@ -367,10 +382,11 @@ export async function startHttpTransport(
       const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
 
       // Public OAuth2 discovery endpoint (RFC 9728). Not served in static-auth
-      // mode — exposing it would cause OAuth-aware clients (mcp-remote, etc.)
-      // to attempt a full OAuth dance that will never complete.
+      // or hybrid-auth mode — exposing it would cause OAuth-aware clients
+      // (mcp-remote, etc.) to attempt a full OAuth dance that will never complete.
       if (
         !options.staticAuth &&
+        !options.hybridAuth &&
         req.method === "GET" &&
         (url.pathname === "/.well-known/oauth-protected-resource" ||
           url.pathname === `/.well-known/oauth-protected-resource${options.path}`)
@@ -386,12 +402,64 @@ export async function startHttpTransport(
       }
 
       // Core MCP dispatch — shared between OAuth and static-auth paths.
+      // Core MCP dispatch — shared between OAuth and static-auth paths.
       const dispatchMcpRequest = async (): Promise<void> => {
-        if (options.stateless) {
-          if (req.method !== "POST") {
-            writeJsonRpcError(res, 405, "Only POST is supported in stateless mode");
+        if (req.method !== "POST") {
+          writeJsonRpcError(
+            res,
+            405,
+            options.stateless ? "Only POST is supported in stateless mode" : "Missing or invalid session ID"
+          );
+          return;
+        }
+
+        // 1. Stateful mode: route by Mcp-Session-Id header if present
+        if (!options.stateless) {
+          const sessionIdHeader = req.headers["mcp-session-id"];
+          const sessionId = Array.isArray(sessionIdHeader) ? sessionIdHeader[0] : sessionIdHeader;
+
+          if (sessionId) {
+            if (sessions.has(sessionId)) {
+              const entry = sessions.get(sessionId)!;
+              entry.lastActivityAt = Date.now();
+              await entry.transport.handleRequest(req, res);
+              return;
+            } else {
+              writeJsonRpcError(res, 400, "Missing or invalid session ID");
+              return;
+            }
+          }
+        }
+
+        // 2. Read body for new connections (stateless request or stateful init)
+        let body: any;
+        try {
+          body = await readJsonBody(req);
+        } catch (error: any) {
+          if (error.name === "PayloadTooLargeError") {
+            writeJsonRpcError(res, 413, error.message);
+          } else {
+            writeJsonRpcError(res, 400, "Invalid JSON body");
+          }
+          return;
+        }
+
+        // 3. Pre-validation in hybridAuth mode on initialization
+        if (options.hybridAuth && isInitializeRequest(body)) {
+          try {
+            // Lazy load apiRequest to avoid circular dependency
+            const { apiRequest } = await import("../services/boond-client.js");
+            await apiRequest("/application/current-user", "GET");
+          } catch (error: any) {
+            const msg = error instanceof Error ? error.message : "Invalid USER_TOKEN";
+            reqLogger.warn({ err: msg }, "Pre-validation failed for USER_TOKEN");
+            writeJsonRpcError(res, 401, `BoondManager authentication failed: ${msg}`);
             return;
           }
+        }
+
+        // 4. Dispatch to stateless transport
+        if (options.stateless) {
           const transport = new StreamableHTTPServerTransport({
             sessionIdGenerator: undefined,
             enableJsonResponse: options.enableJsonResponse,
@@ -402,28 +470,11 @@ export async function startHttpTransport(
             void server.close();
           });
           await server.connect(transport);
-          await transport.handleRequest(req, res);
+          await transport.handleRequest(req, res, body);
           return;
         }
 
-        // Stateful mode: route by Mcp-Session-Id header
-        const sessionIdHeader = req.headers["mcp-session-id"];
-        const sessionId = Array.isArray(sessionIdHeader) ? sessionIdHeader[0] : sessionIdHeader;
-
-        if (sessionId && sessions.has(sessionId)) {
-          const entry = sessions.get(sessionId)!;
-          entry.lastActivityAt = Date.now();
-          await entry.transport.handleRequest(req, res);
-          return;
-        }
-
-        if (req.method !== "POST") {
-          writeJsonRpcError(res, 400, "Missing or invalid session ID");
-          return;
-        }
-
-        // Parse body to detect initialization
-        const body = await readJsonBody(req);
+        // 5. Dispatch to stateful transport (initialization)
         if (!isInitializeRequest(body)) {
           writeJsonRpcError(res, 400, "First request must be an MCP initialize message");
           return;
@@ -481,6 +532,23 @@ export async function startHttpTransport(
         // Static-auth mode: env-based JWT credentials configured at startup via
         // initClient(). No Bearer token required from the MCP client.
         await dispatchMcpRequest();
+      } else if (options.hybridAuth) {
+        // Hybrid mode: the client provides a USER_TOKEN per request via a
+        // dedicated header; the server mints the JWT from env-only credentials.
+        const rawHeader = req.headers[HYBRID_USER_TOKEN_HEADER];
+        const userToken = (Array.isArray(rawHeader) ? rawHeader[0] : rawHeader)?.trim();
+        if (!userToken) {
+          writeJsonRpcError(
+            res,
+            401,
+            `Missing ${HYBRID_USER_TOKEN_HEADER} header. ` +
+              "In BOOND_HTTP_HYBRID_AUTH mode, include your BoondManager user token on every MCP request."
+          );
+          return;
+        }
+        // Wrap in AsyncLocalStorage so hybridContextAuth can pull the
+        // userToken out when issuing API calls to BoondManager.
+        await hybridContext.run({ userToken }, dispatchMcpRequest);
       } else {
         // OAuth2 Bearer is mandatory on the MCP endpoint. The token is opaque
         // to us — we forward it to BoondManager, which is authoritative.

@@ -3,7 +3,14 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { initClient, initClientWithAuth, oauthContextAuth, hasEnvCredentials } from "./services/boond-client.js";
+import {
+  initClient,
+  initClientWithAuth,
+  oauthContextAuth,
+  hybridContextAuth,
+  hasEnvCredentials,
+  hasHybridEnvCredentials,
+} from "./services/boond-client.js";
 import { createMcpServer, REGISTERED_DOMAINS } from "./server.js";
 import { runUpdateNotification } from "./services/update-checker.js";
 import { resolveHttpOptions, startHttpTransport } from "./transports/http.js";
@@ -40,11 +47,19 @@ function resolveStaticAuth(): boolean {
   return v.toLowerCase() === "true" || v === "1" || v.toLowerCase() === "yes";
 }
 
+function resolveHybridAuth(): boolean {
+  const v = process.env["BOOND_HTTP_HYBRID_AUTH"];
+  if (!v || v.startsWith("${")) return false;
+  return v.toLowerCase() === "true" || v === "1" || v.toLowerCase() === "yes";
+}
+
 async function main(): Promise<void> {
   const kind = resolveTransport();
 
   if (kind === "http") {
     const useStaticAuth = resolveStaticAuth();
+    // Static auth takes priority over hybrid when both env vars are set.
+    const useHybridAuth = !useStaticAuth && resolveHybridAuth();
 
     if (useStaticAuth) {
       // Static-auth mode: operator provides env credentials; no per-request
@@ -63,6 +78,17 @@ async function main(): Promise<void> {
         console.error("⚠️  Failed to initialise env-based credentials:", (error as Error).message);
         process.exit(1);
       }
+    } else if (useHybridAuth) {
+      // Hybrid mode: CLIENT_TOKEN + CLIENT_KEY stay on the server; the MCP
+      // client supplies USER_TOKEN per request via X-Boond-User-Token.
+      if (!hasHybridEnvCredentials()) {
+        console.error(
+          "⚠️  BOOND_HTTP_HYBRID_AUTH is set but BOOND_CLIENT_TOKEN and/or BOOND_CLIENT_KEY are missing. " +
+            "Both must be set in the server environment."
+        );
+        process.exit(1);
+      }
+      initClientWithAuth(hybridContextAuth);
     } else {
       // OAuth2 protected resource: each MCP request must carry its own Bearer.
       initClientWithAuth(oauthContextAuth);
@@ -75,6 +101,10 @@ async function main(): Promise<void> {
     console.error(`🔑 Mode: ${options.stateless ? "stateless" : "stateful"}`);
     if (useStaticAuth) {
       console.error("🔐 Boond auth: JWT statique (credentials env, pas de Bearer requis par le client)");
+    } else if (useHybridAuth) {
+      console.error(
+        "🔐 Boond auth: Hybride (USER_TOKEN par requête via X-Boond-User-Token, CLIENT_TOKEN+CLIENT_KEY côté serveur)"
+      );
     } else {
       console.error("🔐 Boond auth: OAuth2 (per-request Bearer from MCP client)");
     }

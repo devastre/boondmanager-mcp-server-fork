@@ -21,12 +21,14 @@ import {
   initClientWithAuth,
   resetClientForTests,
   oauthContextAuth,
+  hybridContextAuth,
+  hasHybridEnvCredentials,
   assertSafeApiPath,
   apiDownload,
   apiUploadForm,
   parseContentDispositionFilename,
 } from "./boond-client.js";
-import { oauthContext } from "./oauth.js";
+import { oauthContext, hybridContext } from "./oauth.js";
 import {
   CHARACTER_LIMIT,
   DEFAULT_HTTP_TIMEOUT_MS,
@@ -1589,5 +1591,159 @@ describe("apiUploadForm", () => {
       })
     );
     await expect(apiUploadForm("/documents", { parentType: "nope" })).rejects.toThrow(/invalid parentType/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// hybridContextAuth & hasHybridEnvCredentials
+// ---------------------------------------------------------------------------
+
+describe("hybridContextAuth", () => {
+  const ORIG_CLIENT_TOKEN = process.env["BOOND_CLIENT_TOKEN"];
+  const ORIG_CLIENT_KEY = process.env["BOOND_CLIENT_KEY"];
+  const ORIG_TTL = process.env["BOOND_JWT_TTL_SECONDS"];
+
+  beforeEach(() => {
+    process.env["BOOND_CLIENT_TOKEN"] = "test-client-token";
+    process.env["BOOND_CLIENT_KEY"] = "test-client-key";
+    delete process.env["BOOND_JWT_TTL_SECONDS"];
+  });
+
+  afterEach(() => {
+    if (ORIG_CLIENT_TOKEN === undefined) {
+      delete process.env["BOOND_CLIENT_TOKEN"];
+    } else {
+      process.env["BOOND_CLIENT_TOKEN"] = ORIG_CLIENT_TOKEN;
+    }
+    if (ORIG_CLIENT_KEY === undefined) {
+      delete process.env["BOOND_CLIENT_KEY"];
+    } else {
+      process.env["BOOND_CLIENT_KEY"] = ORIG_CLIENT_KEY;
+    }
+    if (ORIG_TTL === undefined) {
+      delete process.env["BOOND_JWT_TTL_SECONDS"];
+    } else {
+      process.env["BOOND_JWT_TTL_SECONDS"] = ORIG_TTL;
+    }
+  });
+
+  it("returns the correct X-Jwt-Client-Boondmanager header when context is populated", async () => {
+    const header = await hybridContext.run({ userToken: "my-user-token" }, () => hybridContextAuth());
+    expect(header.name).toBe("X-Jwt-Client-Boondmanager");
+    // The JWT should be a non-empty base64url.base64url.base64url string
+    expect(header.value).toMatch(/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
+  });
+
+  it("JWT payload contains the correct userToken and clientToken claims", async () => {
+    const header = await hybridContext.run({ userToken: "alice-token" }, () => hybridContextAuth());
+    const parts = header.value.split(".");
+    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8")) as Record<string, unknown>;
+    expect(payload["userToken"]).toBe("alice-token");
+    expect(payload["clientToken"]).toBe("test-client-token");
+    // Without TTL, no iat/exp claims
+    expect(payload["iat"]).toBeUndefined();
+    expect(payload["exp"]).toBeUndefined();
+  });
+
+  it("throws an explicit error when called outside a hybrid request context", async () => {
+    // hybridContext.getStore() returns undefined here — no run() wrapper
+    await expect(hybridContextAuth()).rejects.toThrow(/No USER_TOKEN in hybrid request context/);
+    await expect(hybridContextAuth()).rejects.toThrow(/X-Boond-User-Token/);
+  });
+
+  it("throws when BOOND_CLIENT_TOKEN is missing from the environment", async () => {
+    delete process.env["BOOND_CLIENT_TOKEN"];
+    await expect(hybridContext.run({ userToken: "tok" }, () => hybridContextAuth())).rejects.toThrow(
+      /BOOND_CLIENT_TOKEN/
+    );
+  });
+
+  it("throws when BOOND_CLIENT_KEY is missing from the environment", async () => {
+    delete process.env["BOOND_CLIENT_KEY"];
+    await expect(hybridContext.run({ userToken: "tok" }, () => hybridContextAuth())).rejects.toThrow(
+      /BOOND_CLIENT_KEY/
+    );
+  });
+
+  it("produces distinct JWTs for concurrent requests with different USER_TOKENs", async () => {
+    const [headerA, headerB] = await Promise.all([
+      hybridContext.run({ userToken: "user-alice" }, () => hybridContextAuth()),
+      hybridContext.run({ userToken: "user-bob" }, () => hybridContextAuth()),
+    ]);
+    expect(headerA.value).not.toBe(headerB.value);
+    // Both are valid JWT format
+    expect(headerA.value).toMatch(/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
+    expect(headerB.value).toMatch(/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
+    // Decode and confirm different userToken claims
+    const payloadA = JSON.parse(Buffer.from(headerA.value.split(".")[1], "base64url").toString()) as Record<
+      string,
+      unknown
+    >;
+    const payloadB = JSON.parse(Buffer.from(headerB.value.split(".")[1], "base64url").toString()) as Record<
+      string,
+      unknown
+    >;
+    expect(payloadA["userToken"]).toBe("user-alice");
+    expect(payloadB["userToken"]).toBe("user-bob");
+  });
+
+  it("includes iat/exp claims when BOOND_JWT_TTL_SECONDS is set", async () => {
+    process.env["BOOND_JWT_TTL_SECONDS"] = "300";
+    const header = await hybridContext.run({ userToken: "timed-user" }, () => hybridContextAuth());
+    const payload = JSON.parse(Buffer.from(header.value.split(".")[1], "base64url").toString()) as Record<
+      string,
+      unknown
+    >;
+    expect(typeof payload["iat"]).toBe("number");
+    expect(typeof payload["exp"]).toBe("number");
+    expect((payload["exp"] as number) - (payload["iat"] as number)).toBe(300);
+  });
+});
+
+describe("hasHybridEnvCredentials", () => {
+  const ORIG_CLIENT_TOKEN = process.env["BOOND_CLIENT_TOKEN"];
+  const ORIG_CLIENT_KEY = process.env["BOOND_CLIENT_KEY"];
+
+  afterEach(() => {
+    if (ORIG_CLIENT_TOKEN === undefined) {
+      delete process.env["BOOND_CLIENT_TOKEN"];
+    } else {
+      process.env["BOOND_CLIENT_TOKEN"] = ORIG_CLIENT_TOKEN;
+    }
+    if (ORIG_CLIENT_KEY === undefined) {
+      delete process.env["BOOND_CLIENT_KEY"];
+    } else {
+      process.env["BOOND_CLIENT_KEY"] = ORIG_CLIENT_KEY;
+    }
+  });
+
+  it("returns true when both BOOND_CLIENT_TOKEN and BOOND_CLIENT_KEY are set", () => {
+    process.env["BOOND_CLIENT_TOKEN"] = "tok";
+    process.env["BOOND_CLIENT_KEY"] = "key";
+    expect(hasHybridEnvCredentials()).toBe(true);
+  });
+
+  it("returns false when BOOND_CLIENT_TOKEN is missing", () => {
+    delete process.env["BOOND_CLIENT_TOKEN"];
+    process.env["BOOND_CLIENT_KEY"] = "key";
+    expect(hasHybridEnvCredentials()).toBe(false);
+  });
+
+  it("returns false when BOOND_CLIENT_KEY is missing", () => {
+    process.env["BOOND_CLIENT_TOKEN"] = "tok";
+    delete process.env["BOOND_CLIENT_KEY"];
+    expect(hasHybridEnvCredentials()).toBe(false);
+  });
+
+  it("returns false when both are missing", () => {
+    delete process.env["BOOND_CLIENT_TOKEN"];
+    delete process.env["BOOND_CLIENT_KEY"];
+    expect(hasHybridEnvCredentials()).toBe(false);
+  });
+
+  it("returns false when values are unresolved placeholder strings", () => {
+    process.env["BOOND_CLIENT_TOKEN"] = "${CLIENT_TOKEN}";
+    process.env["BOOND_CLIENT_KEY"] = "${CLIENT_KEY}";
+    expect(hasHybridEnvCredentials()).toBe(false);
   });
 });
