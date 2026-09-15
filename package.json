@@ -1,7 +1,7 @@
 {
   "name": "boondmanager-mcp-server",
-  "version": "2.8.1",
-  "description": "MCP Server for BoondManager API - 180 tools, 11 prompts, 22 resources (ERP/CRM)",
+  "version": "2.15.0",
+  "description": "MCP Server for BoondManager API - 182 tools, 12 prompts, 22 resources (ERP/CRM)",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "type": "module",
@@ -9,7 +9,7 @@
     "boondmanager-mcp-server": "dist/index.js"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.0.0"
   },
   "files": [
     "dist",
@@ -40,6 +40,8 @@
     "typecheck": "tsc --noEmit",
     "docs:tools": "npm run build && node scripts/generate-tools-catalog.mjs",
     "docs:tools:check": "npm run build && node scripts/generate-tools-catalog.mjs --check",
+    "plugin:manifest": "node scripts/generate-plugin-manifest.mjs",
+    "plugin:manifest:check": "node scripts/generate-plugin-manifest.mjs --check",
     "api:monitor:test": "node scripts/test-api-monitor.cjs",
     "api:monitor:save": "node scripts/test-api-monitor.cjs --save",
     "prepare": "husky || true",
@@ -65,13 +67,14 @@
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@types/node": "^26.0.0",
-    "@vitest/coverage-v8": "^4.0.18",
+    "@vitest/coverage-v8": "^5.0.0",
+    "ajv": "^8.17.1",
     "eslint": "^10.0.2",
     "husky": "^9.1.7",
     "lint-staged": "^17.0.4",
     "prettier": "^3.8.3",
     "typescript": "^6.0.2",
     "typescript-eslint": "^8.0.0",
-    "vitest": "^4.0.18"
+    "vitest": "^5.0.0"
   }
 }

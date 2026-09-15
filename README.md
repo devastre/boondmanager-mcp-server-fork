@@ -23,7 +23,7 @@
 
 Serveur MCP (Model Context Protocol) pour l'API BoondManager, permettant a Claude (Desktop, Cowork, Code) de rechercher, consulter, creer et modifier des enregistrements dans votre instance BoondManager.
 
-**180 outils** couvrant **38 domaines** de l'API BoondManager. Voir [TOOLS.md](./TOOLS.md) pour le catalogue auto-généré (outils + prompts + ressources).
+**182 outils** couvrant **38 domaines** de l'API BoondManager. Voir [TOOLS.md](./TOOLS.md) pour le catalogue auto-généré (outils + prompts + ressources).
 
 > **Sorties structurées.** En plus du texte lisible, les outils `search`, `create`, `update` et `delete` renvoient un `structuredContent` conforme à un `outputSchema` MCP : `search` → `{ total?, count, items[] }` (résumés compacts, pas les ressources JSON:API complètes), `create`/`update` → `{ id?, type? }`, `delete` → `{ id, deleted, reason? }`. Les clients MCP qui exploitent les sorties structurées obtiennent une référence d'entité fiable pour chaîner les appels. Les outils `get` restent en texte seul (leur texte est déjà du JSON exploitable).
 
@@ -147,6 +147,7 @@ En plus des outils, le serveur expose des **prompts MCP** (templates pre-cables)
 | `candidats_pour_opportunite` | A partir d'une opportunite, propose les candidats actifs qui matchent (outils, expertise, mobilite, dispo). |
 | `fiche_consultant` | Vue 360 d'une ressource : info + technique + positionnements + absences + CRA recents. |
 | `recap_hebdo` | Recap hebdomadaire : pipeline qui a bouge, equipe absente, projets actifs, actions a mener. |
+| `traiter_note_de_frais` | A partir d'une photo/PDF de justificatif joint, extrait la depense et cree la ligne de frais dans Boond apres recapitulatif et validation explicite. |
 
 ### Ressources, competences & CV
 
@@ -206,7 +207,7 @@ Exemples d'invocation des prompts ressources / competences / CV :
 
 ## Prerequis
 
-- Node.js >= 20
+- Node.js >= 22
 - Un compte BoondManager avec acces API active
 - L'option "Allow API Rest calls using BasicAuth authentication" activee dans la configuration BoondManager (si BasicAuth)
 
@@ -216,7 +217,52 @@ Exemples d'invocation des prompts ressources / competences / CV :
 
 Telechargez le fichier `.mcpb` depuis la [derniere release GitHub](https://github.com/fauguste/boondmanager-mcp-server/releases/latest), puis dans Claude Desktop : **Fichier > Installer une extension...** et selectionnez le fichier. Les identifiants sont demandes a l'installation et stockes de maniere chiffree (Keychain macOS / Credential Manager Windows).
 
-### Claude Code
+### Claude Code (plugin, recommande)
+
+Meme confort que le one-click Desktop : un formulaire de configuration, aucune
+variable d'environnement a poser soi-meme.
+
+```
+/plugin marketplace add fauguste/boondmanager-mcp-server
+/plugin install boondmanager-mcp@boondmanager
+```
+
+Claude Code affiche alors le formulaire des 14 options (identifiants, URL de
+base, restrictions d'acces). Tout est optionnel a l'ecran, mais il faut
+renseigner **un** des trois modes d'authentification : le trio `User Token` +
+`Client Token` + `Client Key` (JWT genere automatiquement, recommande), ou le
+`Token JWT` pre-construit, ou le couple `Utilisateur` + `Mot de passe`
+(BasicAuth). Les champs laisses vides retombent sur les valeurs par defaut.
+
+Si le serveur n'apparait pas immediatement dans `/mcp`, un `/reload-plugins`
+suffit — inutile de relancer Claude Code.
+
+Details utiles :
+
+- **Ou vont les secrets** : les 5 champs sensibles (`User Token`, `Client
+  Token`, `Client Key`, `Token JWT`, `Mot de passe`) vont dans le Keychain macOS
+  (ou `~/.claude/.credentials.json` a defaut), **pas** dans `settings.json`. Les
+  options non sensibles (URL, restrictions) sont stockees en clair dans
+  `pluginConfigs` de votre `~/.claude/settings.json`.
+- **Nommage des outils** : cote client les outils sont prefixes
+  `mcp__boondmanager__`, par exemple `mcp__boondmanager__boond_candidates_search`.
+  C'est ce nom qu'il faut utiliser dans une allow-list de permissions.
+- **Version** : le plugin lance la version npm epinglee dans son manifeste. Pour
+  passer a une nouvelle release : `/plugin marketplace update boondmanager` puis
+  reinstaller le plugin.
+- **Restreindre la surface** : les champs *Restriction* du formulaire mappent sur
+  les variables `BOOND_MCP_*` (profil metier, domaines, operations, lecture
+  seule). Voir [docs/access-control.md](./docs/access-control.md).
+- **Suppressions** : Claude Code supporte l'elicitation MCP, donc chaque
+  `boond_*_delete` demande une confirmation avant d'agir (option *Confirmer les
+  suppressions*, activee par defaut).
+
+Pour desinstaller : `/plugin uninstall boondmanager-mcp@boondmanager`.
+
+### Claude Code (manuel, `claude mcp add`)
+
+A privilegier si vous voulez piloter vous-meme les variables d'environnement,
+ou epingler une version differente de celle du plugin.
 
 ```bash
 # Avec un token API (recommande)
@@ -523,7 +569,7 @@ L'API BoondManager n'expose qu'un seul endpoint `/application/dictionary` qui re
 |----------|--------|-------------|
 | `BOOND_DICTIONARY_TTL_MS` | `3600000` (1 h) | Durée de vie du cache du dictionnaire, en millisecondes. Une valeur non numérique ou ≤ 0 retombe sur le défaut. |
 
-### Restriction d'accès (domaines / lecture seule)
+### Restriction d'accès (profils / domaines / lecture seule)
 
 Vous pouvez restreindre **ce que l'IA voit et peut faire**, entièrement par
 variables d'environnement : exposer seulement certains domaines (ex. la
@@ -531,6 +577,7 @@ comptabilité), et/ou bloquer les écritures et suppressions.
 
 | Variable | Effet |
 |----------|-------|
+| `BOOND_MCP_PROFILE` | Profil préconfiguré : `recruiting`, `sales`, `finance`, `delivery`, `admin` (CSV = union). Raccourci pour ne pas lister les domaines à la main. Ignoré si `BOOND_MCP_DOMAINS` est défini. |
 | `BOOND_MCP_DOMAINS` | Liste blanche de domaines (CSV). Absente = tous. Ex. `invoices,payments,application` |
 | `BOOND_MCP_EXCLUDE_DOMAINS` | Liste noire de domaines (CSV), appliquée après la liste blanche. Ex. `candidates,resources` |
 | `BOOND_MCP_OPERATIONS` | Opérations autorisées (CSV) parmi `read,create,update,delete`. Absente = toutes. |
@@ -542,7 +589,26 @@ comptabilité), et/ou bloquer les écritures et suppressions.
 > BoondManager (lecture seule, périmètre comptable…) ; ce filtre vient en
 > complément (économie de tokens, garde-fou anti-action accidentelle).
 
-Guide complet, règles de résolution et exemples : [docs/access-control.md](docs/access-control.md).
+Exemple — tout le périmètre gestion, en lecture seule :
+
+```bash
+export BOOND_MCP_PROFILE=finance
+export BOOND_MCP_READ_ONLY=true
+```
+
+Guide complet, règles de résolution, contenu de chaque profil (et le nombre
+d'outils qui en résulte) : [docs/access-control.md](docs/access-control.md).
+
+### Icônes (SEP-973)
+
+Les outils, prompts et ressources portent une icône par domaine (SVG inline en
+`data:` URI, aucun asset à héberger). Coût mesuré : **~40 Kio, soit ~14 % du
+payload `tools/list`**. Les déploiements qui ne les affichent pas (passerelles,
+clients texte) peuvent les supprimer :
+
+| Variable | Defaut | Description |
+|----------|--------|-------------|
+| `BOOND_MCP_ICONS` | activé | `0`/`false`/`no`/`off` : n'annonce aucune icône (outils, prompts, ressources). |
 
 ### Libellés personnalisés du dictionnaire
 
@@ -574,7 +640,7 @@ Le serveur supporte deux transports MCP, selectionnables via la variable d'envir
 
 ### Streamable HTTP (pour les gateways MCP)
 
-Depuis la v1.4.0, le serveur peut etre expose en HTTP (specification MCP Streamable HTTP 2025-03-26) afin d'etre branche derriere une passerelle MCP ou deploye comme service.
+Depuis la v1.4.0, le serveur peut etre expose en HTTP (transport MCP Streamable HTTP) afin d'etre branche derriere une passerelle MCP ou deploye comme service. La revision de protocole negociee est celle du SDK installe (`2025-11-25`).
 
 > **Authentification BoondManager : OAuth2 protected resource.** Le serveur HTTP **ne detient aucun secret** (ni `client_secret`, ni refresh token, ni stockage utilisateur). Chaque requete MCP doit porter `Authorization: Bearer <boond_access_token>` ; le serveur transmet le token tel quel a BoondManager. C'est le **client MCP** (Claude Desktop, Claude Code, gateway…) qui fait la danse OAuth contre BoondManager et qui gere le refresh. Procedure complete : [docs/oauth.md](docs/oauth.md).
 
@@ -608,8 +674,7 @@ npx boondmanager-mcp-server
 | `MCP_HTTP_SESSION_TTL_MS` | `1800000` (30 min) | En mode stateful, duree d'inactivite au-dela de laquelle une session est fermee. |
 | `MCP_HTTP_SESSION_SWEEP_INTERVAL_MS` | `300000` (5 min) | Frequence de balayage des sessions inactives. |
 | `MCP_HTTP_ALLOWED_HOSTS` | _(auto)_ | Liste blanche du header `Host` (anti DNS rebinding, CVE-2025-66414). `*` pour desactiver explicitement. |
-| `BOOND_HTTP_STATIC_AUTH` | `false` | Activer le mode d'authentification statique (fournir les identifiants Boond via les variables d'environnement). |
-| `BOOND_HTTP_HYBRID_AUTH` | `false` | Activer le mode d'authentification hybride (USER_TOKEN côté client par requête via X-Boond-User-Token, CLIENT_TOKEN+CLIENT_KEY côté serveur). Ignoré si `BOOND_HTTP_STATIC_AUTH` est actif. |
+| `MCP_HTTP_ALLOWED_ORIGINS` | _(auto)_ | Liste blanche du header `Origin` (scheme + host + port) pour les clients navigateur ; un `Origin` hors liste recoit un `403` (exigence spec 2025-11-25). Defaut quand le serveur ecoute en loopback = **toute origine loopback, quel que soit le port** (`http`/`https` sur `localhost` / `127.0.0.1` / `[::1]`) plus l'origine de `MCP_HTTP_PUBLIC_URL` si elle est definie — MCP Inspector (`:6274`) ou un serveur de dev (`:5173`) fonctionnent sans configuration, et une origine distante recoit toujours un `403`. Validation desactivee sinon. Une liste explicite est en revanche comparee a l'identique (port compris). **Une requete sans `Origin` est toujours acceptee** (curl, gateways, clients MCP non-navigateur), et le document de decouverte `/.well-known/oauth-protected-resource` est exempte. `*` pour desactiver explicitement ; une valeur vide n'est pas une desactivation. |
 
 **Variables OAuth2 — discovery (toutes optionnelles)**
 
@@ -843,13 +908,13 @@ npm run typecheck
 
 ### Stack technique
 
-- **Runtime** : Node.js >= 20 (ES2022)
+- **Runtime** : Node.js >= 22 (ES2022)
 - **Langage** : TypeScript 5.8+ (mode strict)
 - **MCP SDK** : @modelcontextprotocol/sdk 1.12+
 - **Validation** : Zod 4
 - **Tests** : Vitest 4 + couverture V8
 - **Lint** : ESLint 10 + typescript-eslint
-- **Transports** : stdio (defaut) + Streamable HTTP (MCP 2025-03-26)
+- **Transports** : stdio (defaut) + Streamable HTTP (spec MCP 2025-11-25)
 
 ## Ressources
 

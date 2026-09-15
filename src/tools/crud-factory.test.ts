@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import {
   buildJsonApiBody,
   buildListStructured,
@@ -32,7 +33,7 @@ interface ElicitResult {
 function createMockServerWithClient(elicitation: boolean, elicitResult?: ElicitResult | Error) {
   const elicitInput = vi.fn(async () => {
     if (elicitResult instanceof Error) throw elicitResult;
-    return elicitResult ?? { action: "accept", content: { confirm: true } };
+    return elicitResult ?? { action: "accept", content: { confirmation: "delete" } };
   });
   const server = {
     registerTool: vi.fn(),
@@ -297,6 +298,32 @@ describe("registerSearchTool handler", () => {
     expect(query).not.toHaveProperty("fields");
     expect(query).not.toHaveProperty("fields[]");
   });
+
+  // Progress is handed to apiSearch, which only uses it on the chunked path.
+  // The factory's job is just to forward a reporter built from `extra`.
+  it("forwards an enabled progress reporter when the client sent a progressToken", async () => {
+    vi.mocked(apiSearch).mockReset().mockResolvedValue(RESPONSE);
+    const server = createMockServer();
+    registerSearchTool(server, OPTS);
+    const handler = vi.mocked(server.registerTool).mock.calls[0][2] as unknown as (
+      params: unknown,
+      extra: unknown
+    ) => Promise<unknown>;
+
+    await handler({ keywords: "x" }, { _meta: { progressToken: "t" }, sendNotification: vi.fn() });
+
+    const reporter = vi.mocked(apiSearch).mock.calls[0][2];
+    expect(reporter?.enabled).toBe(true);
+  });
+
+  it("forwards a disabled reporter when there is no progressToken", async () => {
+    vi.mocked(apiSearch).mockReset().mockResolvedValue(RESPONSE);
+    const server = createMockServer();
+    registerSearchTool(server, OPTS);
+    await registeredHandler(server)({ keywords: "x" });
+
+    expect(vi.mocked(apiSearch).mock.calls[0][2]?.enabled).toBe(false);
+  });
 });
 
 describe("buildListStructured", () => {
@@ -305,6 +332,27 @@ describe("buildListStructured", () => {
     expect(structured.total).toBeUndefined();
     expect(structured.count).toBe(1);
     expect(structured.items[0].id).toBe("7");
+  });
+
+  it("projects the selected attributes", () => {
+    const structured = buildListStructured(
+      { data: [{ id: "1", type: "invoice", attributes: { reference: "F-1", state: 10 } }] },
+      ["reference"]
+    );
+    expect(structured.items[0].attributes).toEqual({ reference: "F-1" });
+    expect(structured.items[0].summary).toBeUndefined();
+  });
+
+  // `/calendars` and dictionary-style endpoints return flat items with no
+  // `attributes` wrapper. The text output projects them fine; structuredContent
+  // used to hand back `{}` for every row, so a client trusting the declared
+  // outputSchema saw bare ids.
+  it("projects flat items that have no attributes wrapper", () => {
+    const structured = buildListStructured(
+      { data: [{ id: "1", type: "calendar", value: "Congés payés", typeOf: 1 }] as never },
+      ["value", "typeOf"]
+    );
+    expect(structured.items[0].attributes).toEqual({ value: "Congés payés", typeOf: 1 });
   });
 });
 
@@ -328,12 +376,63 @@ describe("registerDeleteTool handler (elicitation)", () => {
   });
 
   it("deletes after an accepted confirmation", async () => {
-    const { server, elicitInput } = createMockServerWithClient(true, { action: "accept", content: { confirm: true } });
+    const { server, elicitInput } = createMockServerWithClient(true, {
+      action: "accept",
+      content: { confirmation: "delete" },
+    });
     registerDeleteTool(server, OPTS);
     const result = await registeredHandler(server)({ id: "12" });
     expect(elicitInput).toHaveBeenCalledOnce();
     expect(apiRequest).toHaveBeenCalledWith("/tests/12", "DELETE");
     expect(result.structuredContent).toEqual({ id: "12", deleted: true });
+  });
+
+  it("requests a titled single-select enum defaulting to cancel (SEP-1330/1034)", async () => {
+    const { server, elicitInput } = createMockServerWithClient(true, { action: "cancel" });
+    registerDeleteTool(server, OPTS);
+    await registeredHandler(server)({ id: "12" });
+    const params = elicitInput.mock.calls[0]?.[0] as unknown as {
+      requestedSchema: {
+        properties: {
+          confirmation: { type: string; default: string; oneOf: Array<{ const: string; title: string }> };
+        };
+        required?: string[];
+      };
+    };
+    const field = params.requestedSchema.properties.confirmation;
+    expect(field.type).toBe("string");
+    expect(field.default).toBe("cancel");
+    expect(field.oneOf).toEqual([
+      { const: "delete", title: "Supprimer définitivement" },
+      { const: "cancel", title: "Annuler" },
+    ]);
+    // No `required`: the SDK validates the response against this schema with
+    // Ajv, and a rejection would throw us into the "delete anyway" fallback.
+    expect(params.requestedSchema.required).toBeUndefined();
+  });
+
+  it("aborts when the user picks cancel", async () => {
+    const { server } = createMockServerWithClient(true, { action: "accept", content: { confirmation: "cancel" } });
+    registerDeleteTool(server, OPTS);
+    const result = await registeredHandler(server)({ id: "12" });
+    expect(apiRequest).not.toHaveBeenCalled();
+    expect(result.structuredContent).toMatchObject({ id: "12", deleted: false, reason: "confirmation=cancel" });
+  });
+
+  it("still honours the legacy boolean answer (confirm: true)", async () => {
+    const { server } = createMockServerWithClient(true, { action: "accept", content: { confirm: true } });
+    registerDeleteTool(server, OPTS);
+    const result = await registeredHandler(server)({ id: "12" });
+    expect(apiRequest).toHaveBeenCalledWith("/tests/12", "DELETE");
+    expect(result.structuredContent).toEqual({ id: "12", deleted: true });
+  });
+
+  it("aborts on an accepted-but-uninterpretable answer (safe direction)", async () => {
+    const { server } = createMockServerWithClient(true, { action: "accept", content: {} });
+    registerDeleteTool(server, OPTS);
+    const result = await registeredHandler(server)({ id: "12" });
+    expect(apiRequest).not.toHaveBeenCalled();
+    expect(result.structuredContent).toMatchObject({ id: "12", deleted: false, reason: "not-confirmed" });
   });
 
   it("aborts when the user declines", async () => {
@@ -345,12 +444,45 @@ describe("registerDeleteTool handler (elicitation)", () => {
     expect(result.content[0].text).toContain("annulée");
   });
 
-  it("aborts when the user answers confirm=false", async () => {
+  it("aborts when a legacy client answers confirm=false", async () => {
     const { server } = createMockServerWithClient(true, { action: "accept", content: { confirm: false } });
     registerDeleteTool(server, OPTS);
     const result = await registeredHandler(server)({ id: "12" });
     expect(apiRequest).not.toHaveBeenCalled();
-    expect(result.structuredContent).toMatchObject({ id: "12", deleted: false, reason: "confirm=false" });
+    expect(result.structuredContent).toMatchObject({ id: "12", deleted: false, reason: "not-confirmed" });
+  });
+
+  /**
+   * The `oneOf` schema is validated against the answer by the SDK (Ajv) and a
+   * mismatch *throws* — a host that renders the titled enum as a free-text field
+   * and a user typing "annuler" lands here. That is a refusal; routing it into
+   * the "round-trip failed → delete anyway" fallback would delete on an explicit
+   * no, irreversibly.
+   */
+  it("aborts when the client's answer is rejected by the response schema", async () => {
+    const { server } = createMockServerWithClient(
+      true,
+      new McpError(ErrorCode.InvalidParams, "Elicitation response content does not match requested schema: …")
+    );
+    registerDeleteTool(server, OPTS);
+    const result = await registeredHandler(server)({ id: "12" });
+    expect(apiRequest).not.toHaveBeenCalled();
+    expect(result.structuredContent).toMatchObject({
+      id: "12",
+      deleted: false,
+      reason: "invalid-confirmation-response",
+    });
+  });
+
+  it("aborts when the SDK's own response validator blows up", async () => {
+    const { server } = createMockServerWithClient(
+      true,
+      new McpError(ErrorCode.InternalError, "Error validating elicitation response: boom")
+    );
+    registerDeleteTool(server, OPTS);
+    const result = await registeredHandler(server)({ id: "12" });
+    expect(apiRequest).not.toHaveBeenCalled();
+    expect(result.structuredContent).toMatchObject({ id: "12", deleted: false });
   });
 
   it("falls back to deleting when the elicitation round-trip fails", async () => {

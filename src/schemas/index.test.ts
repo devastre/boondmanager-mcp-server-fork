@@ -4,6 +4,7 @@ import {
   SearchSchema,
   IdSchema,
   IdTabSchema,
+  DocumentIdSchema,
   CandidateCreateSchema,
   CandidateUpdateSchema,
   ResourceCreateSchema,
@@ -19,6 +20,10 @@ import {
   ContactSearchSchema,
   OpportunitySearchSchema,
   ActionSearchSchema,
+  CompanySearchSchema,
+  ProjectSearchSchema,
+  ValidationSearchSchema,
+  NotificationSearchSchema,
   ActionCreateSchema,
   ResourceTimesheetSchema,
   TimesheetSearchSchema,
@@ -37,6 +42,7 @@ import {
   AbsenceSearchSchema,
   ExpenseCreateSchema,
   ExpenseUpdateSchema,
+  ExpenseDefaultSchema,
   ExpenseSearchSchema,
   ProductCreateSchema,
   ProductUpdateSchema,
@@ -139,6 +145,45 @@ describe("IdSchema", () => {
     for (const id of ["../invoices/5", "1?maxResults=99999", "1/financial", "abc", "%2e%2e"]) {
       expect(IdSchema.safeParse({ id }).success, id).toBe(false);
     }
+  });
+});
+
+describe("DocumentIdSchema", () => {
+  it("should accept the suffixed ids exposed by entity relations", () => {
+    for (const id of ["123_resume", "5_file", "42_administrativeFile", "7_picture"]) {
+      expect(DocumentIdSchema.safeParse({ id }).success, id).toBe(true);
+    }
+  });
+
+  it("should still accept a bare numeric id", () => {
+    expect(DocumentIdSchema.safeParse({ id: "123" }).success).toBe(true);
+  });
+
+  it("should keep the path-traversal / query-injection guard", () => {
+    for (const id of [
+      "",
+      "../invoices/5",
+      "1?maxResults=99999",
+      "1/financial",
+      "abc",
+      "%2e%2e",
+      "123_",
+      "123_res ume",
+      "123_resume/../x",
+      "_resume",
+    ]) {
+      expect(DocumentIdSchema.safeParse({ id }).success, id).toBe(false);
+    }
+  });
+
+  it("should reject extra fields (strict mode)", () => {
+    expect(DocumentIdSchema.safeParse({ id: "123_resume", tab: "information" }).success).toBe(false);
+  });
+
+  it("should explain the suffix in its error message", () => {
+    const result = DocumentIdSchema.safeParse({ id: "cv.pdf" });
+    expect(result.success).toBe(false);
+    expect(result.error?.issues[0].message).toContain("123_resume");
   });
 });
 
@@ -581,25 +626,135 @@ describe("AbsenceSearchSchema", () => {
   });
 });
 
+// A line the live API accepts, minus everything the schema defaults.
+const VALID_LINE = {
+  startDate: "2027-01-15",
+  expenseTypeReference: 1,
+  amountIncludingTax: 12.34,
+  tax: 10,
+  projectId: "1607",
+  deliveryId: "7889",
+};
+
 describe("ExpenseCreateSchema", () => {
-  it("should accept valid expense", () => {
+  it("should accept a report with one line", () => {
     const result = ExpenseCreateSchema.safeParse({
       resourceId: "123",
-      expenseDate: "2025-06-15",
-      amount: 45.5,
+      agencyId: "3",
+      term: "2027-01",
+      actualExpenses: [VALID_LINE],
     });
     expect(result.success).toBe(true);
   });
 
-  it("should require resourceId, expenseDate, amount", () => {
+  it("should require resourceId and term", () => {
     expect(ExpenseCreateSchema.safeParse({}).success).toBe(false);
     expect(ExpenseCreateSchema.safeParse({ resourceId: "1" }).success).toBe(false);
+    expect(ExpenseCreateSchema.safeParse({ term: "2027-01" }).success).toBe(false);
+  });
+
+  it("should accept a report with no line at all (empty container)", () => {
+    expect(ExpenseCreateSchema.safeParse({ resourceId: "1", term: "2027-01" }).success).toBe(true);
+  });
+
+  it("should reject a term that is not YYYY-MM", () => {
+    for (const term of ["2027", "2027-1", "2027-01-15", "janvier 2027"]) {
+      expect(ExpenseCreateSchema.safeParse({ resourceId: "1", term }).success).toBe(false);
+    }
+  });
+
+  // exchangeRateAgency is required by the API (1002 otherwise) — defaulting it
+  // here is what keeps a minimal call from 422-ing.
+  it("should default exchangeRateAgency to 1", () => {
+    const parsed = ExpenseCreateSchema.parse({ resourceId: "1", term: "2027-01" });
+    expect(parsed.exchangeRateAgency).toBe(1);
+  });
+
+  // The API demands these four on every line and reports them one 422 wave at a
+  // time; defaults are what spare the caller five round-trips of discovery.
+  it("should default the line flags the API requires but never varies", () => {
+    const parsed = ExpenseCreateSchema.parse({
+      resourceId: "1",
+      term: "2027-01",
+      actualExpenses: [VALID_LINE],
+    });
+    expect(parsed.actualExpenses?.[0]).toMatchObject({
+      isKilometricExpense: false,
+      reinvoiced: false,
+      currency: 0,
+      exchangeRate: 1,
+      activityType: "production",
+    });
+  });
+
+  it("should require projectId and deliveryId on every line", () => {
+    for (const key of ["projectId", "deliveryId", "startDate"] as const) {
+      const line: Record<string, unknown> = { ...VALID_LINE };
+      delete line[key];
+      expect(ExpenseCreateSchema.safeParse({ resourceId: "1", term: "2027-01", actualExpenses: [line] }).success).toBe(
+        false
+      );
+    }
+  });
+
+  it("should accept a kilometric line without an expense type", () => {
+    const result = ExpenseCreateSchema.safeParse({
+      resourceId: "1",
+      term: "2027-01",
+      ratePerKilometerTypeReference: 3,
+      actualExpenses: [
+        {
+          startDate: "2027-01-15",
+          isKilometricExpense: true,
+          numberOfKilometers: 42,
+          projectId: "1607",
+          deliveryId: "7889",
+        },
+      ],
+    });
+    expect(result.success).toBe(true);
+  });
+
+  // `state` is accepted then ignored by the API on POST *and* PUT — exposing it
+  // promised a transition the endpoint does not perform.
+  it("should reject the legacy fields that never worked", () => {
+    for (const legacy of [
+      { expenseDate: "2027-01-15" },
+      { amount: 45.5 },
+      { typeOf: "1" },
+      { currency: "EUR" },
+      { note: "..." },
+      { state: "waitingForValidation" },
+    ]) {
+      expect(ExpenseCreateSchema.safeParse({ resourceId: "1", term: "2027-01", ...legacy }).success).toBe(false);
+    }
   });
 });
 
 describe("ExpenseUpdateSchema", () => {
   it("should require id", () => {
     expect(ExpenseUpdateSchema.safeParse({}).success).toBe(false);
+  });
+
+  it("should allow a partial update that touches no line", () => {
+    expect(ExpenseUpdateSchema.safeParse({ id: "4567", informationComments: "ok" }).success).toBe(true);
+  });
+
+  it("should warn in its description that actualExpenses replaces every line", () => {
+    const shape = (ExpenseUpdateSchema as unknown as { shape: Record<string, { description?: string }> }).shape;
+    expect(shape.actualExpenses?.description).toContain("REMPLACE");
+  });
+
+  it("should reject state (moved by the validation workflow, not by a write)", () => {
+    expect(ExpenseUpdateSchema.safeParse({ id: "1", state: "validated" }).success).toBe(false);
+  });
+});
+
+describe("ExpenseDefaultSchema", () => {
+  it("should require resourceId and a YYYY-MM term", () => {
+    expect(ExpenseDefaultSchema.safeParse({ resourceId: "1", term: "2027-01" }).success).toBe(true);
+    expect(ExpenseDefaultSchema.safeParse({ resourceId: "1" }).success).toBe(false);
+    expect(ExpenseDefaultSchema.safeParse({ resourceId: "1", term: "2027" }).success).toBe(false);
   });
 });
 
@@ -835,5 +990,55 @@ describe("Reporting schemas", () => {
       }).success
     ).toBe(true);
     expect(ReportingProductionPlansSchema.safeParse({ positioningStates: [1] }).success).toBe(false);
+  });
+});
+
+// The `fields` projection is what keeps a large result page token-cheap. It
+// used to exist only on the six main search schemas, which left the highest
+// volume endpoints (invoices, orders, actions…) with no way to trim a page —
+// and no usable default summary either, since those rows carry no name.
+describe("fields projection availability", () => {
+  // `base` carries the schema's required filters, if any, so the assertion is
+  // about `fields` alone and not about a missing required key.
+  const schemasWithFields: ReadonlyArray<
+    readonly [string, { safeParse: (v: unknown) => { success: boolean } }, Record<string, unknown>]
+  > = [
+    ["SearchSchema", SearchSchema, {}],
+    ["ResourceSearchSchema", ResourceSearchSchema, {}],
+    ["CandidateSearchSchema", CandidateSearchSchema, {}],
+    ["ContactSearchSchema", ContactSearchSchema, {}],
+    ["CompanySearchSchema", CompanySearchSchema, {}],
+    ["OpportunitySearchSchema", OpportunitySearchSchema, {}],
+    ["ProjectSearchSchema", ProjectSearchSchema, {}],
+    ["ActionSearchSchema", ActionSearchSchema, {}],
+    ["InvoiceSearchSchema", InvoiceSearchSchema, {}],
+    ["OrderSearchSchema", OrderSearchSchema, {}],
+    ["DeliverySearchSchema", DeliverySearchSchema, {}],
+    ["AbsenceSearchSchema", AbsenceSearchSchema, {}],
+    ["ExpenseSearchSchema", ExpenseSearchSchema, {}],
+    ["PositioningSearchSchema", PositioningSearchSchema, {}],
+    ["PaymentSearchSchema", PaymentSearchSchema, {}],
+    ["AdvantageSearchSchema", AdvantageSearchSchema, {}],
+    ["ValidationSearchSchema", ValidationSearchSchema, { startMonth: "2026-01", endMonth: "2026-03" }],
+    ["NotificationSearchSchema", NotificationSearchSchema, { category: "activity" }],
+  ];
+
+  it.each(schemasWithFields)("%s accepts a fields projection", (_name, schema, base) => {
+    expect(schema.safeParse({ ...base, fields: ["reference", "date"] }).success).toBe(true);
+  });
+
+  it.each(schemasWithFields)("%s still rejects an unknown key", (_name, schema, base) => {
+    expect(schema.safeParse({ ...base, nopeNotAFilter: true }).success).toBe(false);
+  });
+
+  it("rejects a non-string fields entry", () => {
+    expect(SearchSchema.safeParse({ fields: [42] }).success).toBe(false);
+  });
+
+  // TimesheetSearchSchema is deliberately excluded: boond_timesheets_search
+  // renders through formatTimesheetSummary, so a `fields` input would be
+  // advertised and then silently ignored.
+  it("does not advertise fields on the timesheet search", () => {
+    expect(TimesheetSearchSchema.safeParse({ fields: ["term"] }).success).toBe(false);
   });
 });

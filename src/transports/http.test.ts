@@ -1,6 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { request as httpRequest } from "node:http";
-import { resolveAllowedHosts, resolveHttpOptions, startHttpTransport, type HttpServerHandle } from "./http.js";
+import {
+  isDiscoveryPath,
+  isOriginAllowed,
+  resolveAllowedHosts,
+  resolveHttpOptions,
+  resolveOriginPolicy,
+  startHttpTransport,
+  type HttpServerHandle,
+} from "./http.js";
 import { createMcpServer } from "../server.js";
 import { initClientWithAuth, hybridContextAuth, resetClientForTests } from "../services/boond-client.js";
 
@@ -54,6 +62,7 @@ const ENV_KEYS = [
   "MCP_HTTP_SESSION_TTL_MS",
   "MCP_HTTP_SESSION_SWEEP_INTERVAL_MS",
   "MCP_HTTP_ALLOWED_HOSTS",
+  "MCP_HTTP_ALLOWED_ORIGINS",
   "MCP_HTTP_PUBLIC_URL",
   "BOOND_OAUTH_AUTHORIZATION_SERVER",
   "BOOND_OAUTH_SCOPES",
@@ -63,6 +72,18 @@ const ENV_KEYS = [
 
 /** Shorthand for an authenticated MCP request body (OAuth Bearer required). */
 const AUTH_HEADER = { Authorization: "Bearer test-access-token" };
+
+/** Minimal, valid MCP `initialize` payload. */
+const INIT_BODY = JSON.stringify({
+  jsonrpc: "2.0",
+  id: 1,
+  method: "initialize",
+  params: {
+    protocolVersion: "2025-06-18",
+    capabilities: {},
+    clientInfo: { name: "vitest", version: "1.0.0" },
+  },
+});
 
 function clearEnv(): void {
   for (const key of ENV_KEYS) delete process.env[key];
@@ -139,6 +160,17 @@ describe("resolveHttpOptions", () => {
     expect(opts.allowedHosts).toBeUndefined();
   });
 
+  it("parses MCP_HTTP_ALLOWED_ORIGINS as a comma-separated list", () => {
+    process.env["MCP_HTTP_ALLOWED_ORIGINS"] = "https://app.example.com, http://localhost:5173 ,";
+    const opts = resolveHttpOptions();
+    expect(opts.allowedOrigins).toEqual(["https://app.example.com", "http://localhost:5173"]);
+  });
+
+  it("leaves allowedOrigins undefined when MCP_HTTP_ALLOWED_ORIGINS is unset", () => {
+    const opts = resolveHttpOptions();
+    expect(opts.allowedOrigins).toBeUndefined();
+  });
+
   it("reads BOOND_HTTP_STATIC_AUTH correctly", () => {
     process.env["BOOND_HTTP_STATIC_AUTH"] = "true";
     expect(resolveHttpOptions().staticAuth).toBe(true);
@@ -198,6 +230,117 @@ describe("resolveAllowedHosts", () => {
   });
 });
 
+describe("resolveOriginPolicy", () => {
+  it("accepts any loopback origin by default when bound to a loopback interface", () => {
+    const policy = resolveOriginPolicy(undefined, "127.0.0.1");
+    expect(policy).toEqual({ enabled: true, origins: [], allowAnyLoopback: true });
+    // The port is deliberately NOT pinned: nothing is served from the MCP port,
+    // so the browser clients that legitimately show up sit on other local ports.
+    for (const origin of [
+      "http://localhost:6274", // MCP Inspector
+      "http://127.0.0.1:5173", // Vite dev server
+      "http://[::1]:8080",
+      "https://localhost:3000",
+      "http://localhost", // implicit :80
+    ]) {
+      expect(isOriginAllowed(policy, origin)).toBe(true);
+    }
+  });
+
+  it("still rejects remote origins under the loopback default (DNS rebinding)", () => {
+    const policy = resolveOriginPolicy(undefined, "localhost");
+    for (const origin of [
+      "https://evil.example.com",
+      "http://127.0.0.1.nip.io", // resolves to loopback, hostname is not
+      "http://localhost.evil.example.com",
+      "file://",
+      "null",
+    ]) {
+      expect(isOriginAllowed(policy, origin)).toBe(false);
+    }
+  });
+
+  it("adds the public URL's origin to the loopback default (reverse-proxy deployment)", () => {
+    const policy = resolveOriginPolicy(undefined, "127.0.0.1", "https://mcp.example.com/mcp");
+    expect(policy.origins).toEqual(["https://mcp.example.com"]);
+    expect(isOriginAllowed(policy, "https://mcp.example.com")).toBe(true);
+    expect(isOriginAllowed(policy, "https://other.example.com")).toBe(false);
+  });
+
+  it("ignores an unparseable public URL rather than throwing", () => {
+    expect(resolveOriginPolicy(undefined, "127.0.0.1", "not a url").origins).toEqual([]);
+  });
+
+  it("disables validation when bound to a non-loopback interface with no config", () => {
+    const policy = resolveOriginPolicy(undefined, "0.0.0.0");
+    expect(policy.enabled).toBe(false);
+    expect(isOriginAllowed(policy, "https://evil.example.com")).toBe(true);
+  });
+
+  it("treats an empty configured list as unconfigured, not as disabled", () => {
+    // A blank `MCP_HTTP_ALLOWED_ORIGINS=` must not silently switch the check
+    // off — `*` is the explicit opt-out. Asserted on a *loopback* bind, where
+    // the two behaviours actually differ.
+    const policy = resolveOriginPolicy([], "127.0.0.1");
+    expect(policy).toEqual({ enabled: true, origins: [], allowAnyLoopback: true });
+    expect(isOriginAllowed(policy, "https://evil.example.com")).toBe(false);
+    expect(resolveOriginPolicy([], "0.0.0.0").enabled).toBe(false);
+  });
+
+  it("treats a sole `*` as an explicit opt-out", () => {
+    const policy = resolveOriginPolicy(["*"], "127.0.0.1");
+    expect(policy.enabled).toBe(false);
+    expect(isOriginAllowed(policy, "https://evil.example.com")).toBe(true);
+  });
+
+  it("ignores `*` when mixed with real origins (keeps validation on)", () => {
+    const policy = resolveOriginPolicy(["*", "https://app.example.com"], "0.0.0.0");
+    expect(policy).toEqual({
+      enabled: true,
+      origins: ["https://app.example.com"],
+      allowAnyLoopback: false,
+    });
+  });
+
+  it("matches an explicit list exactly — port-sensitive, no loopback shortcut", () => {
+    const policy = resolveOriginPolicy(["http://localhost:5173"], "127.0.0.1");
+    expect(policy.allowAnyLoopback).toBe(false);
+    expect(isOriginAllowed(policy, "http://localhost:5173")).toBe(true);
+    expect(isOriginAllowed(policy, "http://localhost:6274")).toBe(false);
+  });
+
+  it("normalises configured origins (case, whitespace, trailing slashes)", () => {
+    expect(resolveOriginPolicy(["HTTPS://App.Example.COM/"], "0.0.0.0").origins).toEqual(["https://app.example.com"]);
+    expect(resolveOriginPolicy([" https://app.example.com///"], "0.0.0.0").origins).toEqual([
+      "https://app.example.com",
+    ]);
+  });
+
+  it("normalises a long run of trailing slashes in linear time", () => {
+    // Guards the js/polynomial-redos fix: normalisation runs on the
+    // caller-supplied Origin header, so it must not backtrack.
+    const origin = `https://app.example.com${"/".repeat(50_000)}`;
+    const started = process.hrtime.bigint();
+    expect(resolveOriginPolicy([origin], "0.0.0.0").origins).toEqual(["https://app.example.com"]);
+    const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+    expect(elapsedMs).toBeLessThan(250);
+  });
+});
+
+describe("isDiscoveryPath", () => {
+  it("matches the bare and path-suffixed RFC 9728 metadata paths", () => {
+    expect(isDiscoveryPath("/.well-known/oauth-protected-resource", "/mcp")).toBe(true);
+    expect(isDiscoveryPath("/.well-known/oauth-protected-resource/mcp", "/mcp")).toBe(true);
+    expect(isDiscoveryPath("/.well-known/oauth-protected-resource?x=1", "/mcp")).toBe(true);
+  });
+
+  it("does not match anything else", () => {
+    expect(isDiscoveryPath("/mcp", "/mcp")).toBe(false);
+    expect(isDiscoveryPath("/.well-known/oauth-authorization-server", "/mcp")).toBe(false);
+    expect(isDiscoveryPath(undefined, "/mcp")).toBe(false);
+  });
+});
+
 describe("startHttpTransport (integration)", () => {
   let handle: HttpServerHandle | undefined;
 
@@ -209,7 +352,7 @@ describe("startHttpTransport (integration)", () => {
   it("serves /healthz without authentication", async () => {
     handle = await startHttpTransport(createMcpServer, {
       host: "127.0.0.1",
-      port: 34561,
+      port: 0,
       path: "/mcp",
       stateless: true,
       enableJsonResponse: true,
@@ -227,7 +370,7 @@ describe("startHttpTransport (integration)", () => {
   it("serves /healthz even when the Host header is not in the allow-list", async () => {
     handle = await startHttpTransport(createMcpServer, {
       host: "127.0.0.1",
-      port: 34562,
+      port: 0,
       path: "/mcp",
       stateless: true,
       enableJsonResponse: true,
@@ -242,7 +385,7 @@ describe("startHttpTransport (integration)", () => {
   it("does not answer /healthz on non-GET methods", async () => {
     handle = await startHttpTransport(createMcpServer, {
       host: "127.0.0.1",
-      port: 34563,
+      port: 0,
       path: "/mcp",
       stateless: true,
       enableJsonResponse: true,
@@ -254,7 +397,7 @@ describe("startHttpTransport (integration)", () => {
   it("returns 404 for unknown paths", async () => {
     handle = await startHttpTransport(createMcpServer, {
       host: "127.0.0.1",
-      port: 34567,
+      port: 0,
       path: "/mcp",
       stateless: true,
       enableJsonResponse: true,
@@ -266,7 +409,7 @@ describe("startHttpTransport (integration)", () => {
   it("rejects GET in stateless mode with 405", async () => {
     handle = await startHttpTransport(createMcpServer, {
       host: "127.0.0.1",
-      port: 34568,
+      port: 0,
       path: "/mcp",
       stateless: true,
       enableJsonResponse: true,
@@ -282,7 +425,7 @@ describe("startHttpTransport (integration)", () => {
   it("returns 401 with a WWW-Authenticate challenge when no Bearer token is present", async () => {
     handle = await startHttpTransport(createMcpServer, {
       host: "127.0.0.1",
-      port: 34569,
+      port: 0,
       path: "/mcp",
       stateless: true,
       enableJsonResponse: true,
@@ -301,7 +444,7 @@ describe("startHttpTransport (integration)", () => {
   it("rejects requests with a non-Bearer Authorization scheme", async () => {
     handle = await startHttpTransport(createMcpServer, {
       host: "127.0.0.1",
-      port: 34579,
+      port: 0,
       path: "/mcp",
       stateless: true,
       enableJsonResponse: true,
@@ -317,7 +460,7 @@ describe("startHttpTransport (integration)", () => {
   it("publishes RFC 9728 protected-resource metadata at /.well-known/oauth-protected-resource", async () => {
     handle = await startHttpTransport(createMcpServer, {
       host: "127.0.0.1",
-      port: 34580,
+      port: 0,
       path: "/mcp",
       stateless: true,
       enableJsonResponse: true,
@@ -335,7 +478,7 @@ describe("startHttpTransport (integration)", () => {
   it("serves the path-suffixed metadata variant per RFC 9728 §3.2", async () => {
     handle = await startHttpTransport(createMcpServer, {
       host: "127.0.0.1",
-      port: 34581,
+      port: 0,
       path: "/mcp",
       stateless: true,
       enableJsonResponse: true,
@@ -351,7 +494,7 @@ describe("startHttpTransport (integration)", () => {
     process.env["BOOND_OAUTH_SCOPES"] = "candidates,resources";
     handle = await startHttpTransport(createMcpServer, {
       host: "127.0.0.1",
-      port: 34582,
+      port: 0,
       path: "/mcp",
       stateless: true,
       enableJsonResponse: true,
@@ -365,11 +508,17 @@ describe("startHttpTransport (integration)", () => {
   it("reaps idle stateful sessions on sweep", async () => {
     handle = await startHttpTransport(createMcpServer, {
       host: "127.0.0.1",
-      port: 34571,
+      port: 0,
       path: "/mcp",
       stateless: false,
       enableJsonResponse: true,
-      sessionTtlMs: 50,
+      // Wide enough that the `initialize` round-trip (which instantiates a full
+      // McpServer and its ~180 tool registrations) cannot itself age the session
+      // past the TTL before the first sweep runs. A tight budget here made the
+      // "fresh session is not reaped" assertion fail whenever the suite ran
+      // under load — it measured the machine, not the sweep logic. Do not shrink
+      // it back: at 50 ms this failed ~2 runs out of 6 of the full suite.
+      sessionTtlMs: 1_000,
       // Big sweep interval so the periodic timer never fires during this
       // test — we drive the sweep explicitly via the handle.
       sessionSweepIntervalMs: 60_000,
@@ -403,7 +552,7 @@ describe("startHttpTransport (integration)", () => {
     expect(handle.sessionCount()).toBe(1);
 
     // Wait past the TTL, then a sweep should reap the idle session.
-    await new Promise((resolve) => setTimeout(resolve, 80));
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
     expect(await handle.sweepIdleSessions()).toBe(1);
     expect(handle.sessionCount()).toBe(0);
   });
@@ -411,7 +560,7 @@ describe("startHttpTransport (integration)", () => {
   it("rejects requests with a Host header outside the allow-list", async () => {
     handle = await startHttpTransport(createMcpServer, {
       host: "127.0.0.1",
-      port: 34572,
+      port: 0,
       path: "/mcp",
       stateless: true,
       enableJsonResponse: true,
@@ -425,7 +574,7 @@ describe("startHttpTransport (integration)", () => {
   it("accepts requests with a Host header in the configured allow-list", async () => {
     handle = await startHttpTransport(createMcpServer, {
       host: "0.0.0.0",
-      port: 34573,
+      port: 0,
       path: "/mcp",
       stateless: true,
       enableJsonResponse: true,
@@ -456,7 +605,7 @@ describe("startHttpTransport (integration)", () => {
   it("disables host validation when allowedHosts is `['*']`", async () => {
     handle = await startHttpTransport(createMcpServer, {
       host: "127.0.0.1",
-      port: 34574,
+      port: 0,
       path: "/mcp",
       stateless: true,
       enableJsonResponse: true,
@@ -481,10 +630,189 @@ describe("startHttpTransport (integration)", () => {
     expect(res.status).toBe(200);
   });
 
+  it("accepts a request with no Origin header (non-browser clients)", async () => {
+    handle = await startHttpTransport(createMcpServer, {
+      host: "127.0.0.1",
+      port: 0,
+      path: "/mcp",
+      stateless: true,
+      enableJsonResponse: true,
+    });
+    // Default (loopback) origin allow-list is active, but a missing Origin must
+    // never be rejected — curl, gateways and MCP CLI clients don't send one.
+    const res = await postWithHost(handle.address.port, "/mcp", "127.0.0.1", INIT_BODY, {
+      Accept: "application/json, text/event-stream",
+      ...AUTH_HEADER,
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it("accepts a request whose Origin is in the allow-list", async () => {
+    handle = await startHttpTransport(createMcpServer, {
+      host: "127.0.0.1",
+      port: 0,
+      path: "/mcp",
+      stateless: true,
+      enableJsonResponse: true,
+    });
+    // The loopback default accepts any local port, not just the bound one:
+    // a browser client (MCP Inspector, a dev server) is served from elsewhere.
+    for (const origin of [
+      `http://localhost:${handle.address.port}`,
+      "http://localhost:6274",
+      "http://127.0.0.1:5173",
+    ]) {
+      const res = await postWithHost(handle.address.port, "/mcp", "127.0.0.1", INIT_BODY, {
+        Accept: "application/json, text/event-stream",
+        Origin: origin,
+        ...AUTH_HEADER,
+      });
+      expect(res.status, `Origin ${origin} should be accepted`).toBe(200);
+    }
+  });
+
+  it("serves the RFC 9728 discovery document regardless of Origin", async () => {
+    handle = await startHttpTransport(createMcpServer, {
+      host: "127.0.0.1",
+      port: 0,
+      path: "/mcp",
+      stateless: true,
+      enableJsonResponse: true,
+      allowedOrigins: ["https://app.example.com"],
+    });
+    // A browser client only fetches this because a 401 challenge pointed it
+    // here; 403ing it would dead-end the OAuth bootstrap.
+    for (const path of ["/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"]) {
+      const res = await fetch(`http://127.0.0.1:${handle.address.port}${path}`, {
+        headers: { Origin: "https://evil.example.com" },
+      });
+      expect(res.status, `${path} should be served`).toBe(200);
+      const doc = (await res.json()) as { resource?: string };
+      expect(doc.resource).toContain("/mcp");
+    }
+  });
+
+  it("adds the publicUrl origin to the loopback default (reverse-proxy deployment)", async () => {
+    handle = await startHttpTransport(createMcpServer, {
+      host: "127.0.0.1",
+      port: 0,
+      path: "/mcp",
+      stateless: true,
+      enableJsonResponse: true,
+      publicUrl: "https://mcp.example.com/mcp",
+    });
+    const res = await postWithHost(handle.address.port, "/mcp", "127.0.0.1", INIT_BODY, {
+      Accept: "application/json, text/event-stream",
+      Origin: "https://mcp.example.com",
+      ...AUTH_HEADER,
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it("rejects a request with a foreign Origin with 403", async () => {
+    handle = await startHttpTransport(createMcpServer, {
+      host: "127.0.0.1",
+      port: 0,
+      path: "/mcp",
+      stateless: true,
+      enableJsonResponse: true,
+    });
+    const res = await postWithHost(handle.address.port, "/mcp", "127.0.0.1", INIT_BODY, {
+      Accept: "application/json, text/event-stream",
+      Origin: "https://evil.example.com",
+      ...AUTH_HEADER,
+    });
+    expect(res.status).toBe(403);
+    const parsed = JSON.parse(res.body) as { error?: { message?: string } };
+    expect(parsed.error?.message).toMatch(/Invalid Origin/);
+  });
+
+  it("honours an explicit allowedOrigins list", async () => {
+    handle = await startHttpTransport(createMcpServer, {
+      host: "0.0.0.0",
+      port: 0,
+      path: "/mcp",
+      stateless: true,
+      enableJsonResponse: true,
+      allowedHosts: ["mcp.internal"],
+      allowedOrigins: ["https://app.example.com"],
+    });
+    const okRes = await postWithHost(handle.address.port, "/mcp", "mcp.internal", INIT_BODY, {
+      Accept: "application/json, text/event-stream",
+      // Trailing slash + mixed case must still match.
+      Origin: "https://App.example.com/",
+      ...AUTH_HEADER,
+    });
+    expect(okRes.status).toBe(200);
+
+    const koRes = await postWithHost(handle.address.port, "/mcp", "mcp.internal", INIT_BODY, {
+      Accept: "application/json, text/event-stream",
+      Origin: "https://other.example.com",
+      ...AUTH_HEADER,
+    });
+    expect(koRes.status).toBe(403);
+  });
+
+  it("disables origin validation when allowedOrigins is `['*']`", async () => {
+    handle = await startHttpTransport(createMcpServer, {
+      host: "127.0.0.1",
+      port: 0,
+      path: "/mcp",
+      stateless: true,
+      enableJsonResponse: true,
+      allowedOrigins: ["*"],
+    });
+    const res = await postWithHost(handle.address.port, "/mcp", "127.0.0.1", INIT_BODY, {
+      Accept: "application/json, text/event-stream",
+      Origin: "https://anything.example.com",
+      ...AUTH_HEADER,
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it("keeps origin validation on when `*` is mixed with real origins", async () => {
+    handle = await startHttpTransport(createMcpServer, {
+      host: "127.0.0.1",
+      port: 0,
+      path: "/mcp",
+      stateless: true,
+      enableJsonResponse: true,
+      allowedOrigins: ["*", "https://app.example.com"],
+    });
+    const koRes = await postWithHost(handle.address.port, "/mcp", "127.0.0.1", INIT_BODY, {
+      Accept: "application/json, text/event-stream",
+      Origin: "https://anything.example.com",
+      ...AUTH_HEADER,
+    });
+    expect(koRes.status).toBe(403);
+
+    const okRes = await postWithHost(handle.address.port, "/mcp", "127.0.0.1", INIT_BODY, {
+      Accept: "application/json, text/event-stream",
+      Origin: "https://app.example.com",
+      ...AUTH_HEADER,
+    });
+    expect(okRes.status).toBe(200);
+  });
+
+  it("serves /healthz even when the Origin is not in the allow-list", async () => {
+    handle = await startHttpTransport(createMcpServer, {
+      host: "127.0.0.1",
+      port: 0,
+      path: "/mcp",
+      stateless: true,
+      enableJsonResponse: true,
+      allowedOrigins: ["https://app.example.com"],
+    });
+    const res = await fetch(`http://127.0.0.1:${handle.address.port}/healthz`, {
+      headers: { Origin: "https://evil.example.com" },
+    });
+    expect(res.status).toBe(200);
+  });
+
   it("responds to an MCP initialize request in stateless mode", async () => {
     handle = await startHttpTransport(createMcpServer, {
       host: "127.0.0.1",
-      port: 34570,
+      port: 0,
       path: "/mcp",
       stateless: true,
       enableJsonResponse: true,
@@ -517,7 +845,7 @@ describe("startHttpTransport (integration)", () => {
   it("accepts MCP initialize without Bearer token in staticAuth mode", async () => {
     handle = await startHttpTransport(createMcpServer, {
       host: "127.0.0.1",
-      port: 34591,
+      port: 0,
       path: "/mcp",
       stateless: true,
       enableJsonResponse: true,
@@ -549,7 +877,7 @@ describe("startHttpTransport (integration)", () => {
   it("still rejects without Bearer when staticAuth is false (default)", async () => {
     handle = await startHttpTransport(createMcpServer, {
       host: "127.0.0.1",
-      port: 34592,
+      port: 0,
       path: "/mcp",
       stateless: true,
       enableJsonResponse: true,
@@ -565,7 +893,7 @@ describe("startHttpTransport (integration)", () => {
   it("rejects an oversized body with 413 (Content-Length precheck)", async () => {
     handle = await startHttpTransport(createMcpServer, {
       host: "127.0.0.1",
-      port: 34574,
+      port: 0,
       path: "/mcp",
       stateless: true,
       enableJsonResponse: true,
@@ -582,7 +910,7 @@ describe("startHttpTransport (integration)", () => {
   it("rejects new sessions with 503 once the session cap is reached", async () => {
     handle = await startHttpTransport(createMcpServer, {
       host: "127.0.0.1",
-      port: 34575,
+      port: 0,
       path: "/mcp",
       stateless: false,
       enableJsonResponse: true,
@@ -623,7 +951,7 @@ describe("startHttpTransport (integration)", () => {
     // publicUrl whose host embeds the path string ('/mcp') must not be mangled.
     handle = await startHttpTransport(createMcpServer, {
       host: "127.0.0.1",
-      port: 34576,
+      port: 0,
       path: "/mcp",
       stateless: true,
       enableJsonResponse: true,

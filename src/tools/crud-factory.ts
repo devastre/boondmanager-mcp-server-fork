@@ -1,4 +1,5 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import {
   apiRequest,
@@ -8,7 +9,16 @@ import {
   formatDetailResponse,
   formatEntitySummary,
 } from "../services/boond-client.js";
+import { progressReporterFrom } from "../services/progress.js";
 import { SearchSchema, IdSchema, IdTabSchema } from "../schemas/index.js";
+import {
+  defaultSearchDescription,
+  defaultGetDescription,
+  defaultCreateDescription,
+  defaultUpdateDescription,
+  defaultDeleteDescription,
+} from "./description-builders.js";
+import { isFeatureDisabled } from "../config/env-flags.js";
 import type { SearchInput, IdInput, IdTabInput } from "../schemas/index.js";
 import type { JsonApiResponse, JsonApiResource } from "../types.js";
 
@@ -69,7 +79,11 @@ export function buildListStructured(response: JsonApiResponse, fields?: string[]
     if (entity.id !== undefined) item.id = String(entity.id);
     if (entity.type !== undefined) item.type = String(entity.type);
     if (projected) {
-      const attrs = (entity.attributes ?? {}) as Record<string, unknown>;
+      // Some reference endpoints (`/calendars`, dictionary-style payloads) return
+      // flat items with no `attributes` wrapper — same fallback as
+      // `formatProjectedSummary`, otherwise structuredContent held bare ids while
+      // the text output showed the projected values.
+      const attrs = (entity.attributes ?? entity) as Record<string, unknown>;
       const selected: Record<string, unknown> = {};
       for (const field of fields) {
         if (attrs[field] !== undefined) selected[field] = attrs[field];
@@ -100,19 +114,54 @@ function entityRef(response: JsonApiResponse): z.infer<typeof MutationOutputSche
 
 /** `BOOND_MCP_CONFIRM_DELETE=0|false|no|off` opts out of the confirmation prompt. */
 function deleteConfirmationDisabled(): boolean {
-  const v = process.env.BOOND_MCP_CONFIRM_DELETE;
-  if (!v) return false;
-  return ["0", "false", "no", "off"].includes(v.trim().toLowerCase());
+  return isFeatureDisabled(process.env.BOOND_MCP_CONFIRM_DELETE);
 }
 
 /**
  * Ask the end user to confirm a destructive delete through MCP elicitation
- * (spec 2025-06-18). Clients that don't declare the `elicitation` capability
+ * (spec 2025-11-25). Clients that don't declare the `elicitation` capability
  * keep the legacy behaviour (delete proceeds — `destructiveHint` already lets
  * hosts gate the call). A failed elicitation round-trip (e.g. stateless HTTP
  * quirks) also falls back to legacy rather than breaking deletes; only an
- * explicit decline/cancel/`confirm=false` aborts.
+ * explicit decline/cancel, or an answer that isn't "delete", aborts.
+ *
+ * The requested schema is a **titled single-select enum** with a default
+ * (SEP-1330 / SEP-1034), not the boolean it used to be. Rationale: a checkbox
+ * labelled "Confirmer la suppression" is trivially mis-clicked and pre-checked
+ * by some hosts, whereas `oneOf: [{const,title}]` + `default: "cancel"` makes
+ * the safe answer the pre-selected one and puts the consequence
+ * ("Supprimer définitivement") in the option label itself.
+ *
+ * Backwards compatibility is deliberate on two axes:
+ * - a client still answering the old shape (`{ confirm: true }`) is honoured;
+ * - `required` is intentionally NOT set, so the SDK's Ajv validation of the
+ *   response can't reject a legacy-shaped answer merely for omitting the field.
+ *
+ * The response *is* still validated by the SDK against the `oneOf` above, and a
+ * rejection throws — so `isElicitationResponseRejected()` peels that specific
+ * failure out of the catch-all fallback. Without it, a host that renders the
+ * titled enum as a free-text field (SEP-1330 unaware) and a user typing
+ * "annuler" would produce an Ajv rejection that lands in the "round-trip
+ * failed → delete anyway" branch: an explicit refusal causing an irreversible
+ * delete. Lenient schema, strict interpretation, and a validation failure counts
+ * as a refusal — not as a broken transport.
  */
+const CONFIRM_DELETE_VALUE = "delete";
+const CANCEL_DELETE_VALUE = "cancel";
+
+/**
+ * Did `elicitInput` throw because the *client's answer* did not match the
+ * requested schema? The SDK raises `McpError(InvalidParams)` in that case (and
+ * `InternalError` if its own validator blew up on the schema). Both mean "we
+ * never got a usable confirmation", which must abort — unlike a transport /
+ * capability failure, which keeps the legacy direct-delete behaviour.
+ */
+function isElicitationResponseRejected(error: unknown): boolean {
+  if (!(error instanceof McpError)) return false;
+  if (error.code === ErrorCode.InvalidParams) return true;
+  return error.code === ErrorCode.InternalError && /elicitation response/i.test(error.message);
+}
+
 export async function confirmDeletion(
   server: McpServer,
   entityName: string,
@@ -134,20 +183,34 @@ export async function confirmDeletion(
       requestedSchema: {
         type: "object",
         properties: {
-          confirm: {
-            type: "boolean",
-            title: "Confirmer la suppression",
-            description: `Supprimer ${entityName} #${id}`,
+          confirmation: {
+            type: "string",
+            title: `Suppression de ${entityName} #${id}`,
+            description: "Choisir « Supprimer définitivement » pour confirmer, sinon rien ne sera supprimé.",
+            oneOf: [
+              { const: CONFIRM_DELETE_VALUE, title: "Supprimer définitivement" },
+              { const: CANCEL_DELETE_VALUE, title: "Annuler" },
+            ],
+            default: CANCEL_DELETE_VALUE,
           },
         },
-        required: ["confirm"],
       },
     });
-    if (result.action === "accept" && result.content?.confirm === true) {
-      return { confirmed: true };
+    if (result.action !== "accept") return { confirmed: false, reason: result.action };
+
+    const content = result.content ?? {};
+    if (content.confirmation === CONFIRM_DELETE_VALUE) return { confirmed: true };
+    // Legacy boolean answer from a client built against the previous schema.
+    if (content.confirmation === undefined && content.confirm === true) return { confirmed: true };
+    return {
+      confirmed: false,
+      reason: typeof content.confirmation === "string" ? `confirmation=${content.confirmation}` : "not-confirmed",
+    };
+  } catch (error) {
+    // An off-schema answer is a refusal, not a broken round-trip: never delete.
+    if (isElicitationResponseRejected(error)) {
+      return { confirmed: false, reason: "invalid-confirmation-response" };
     }
-    return { confirmed: false, reason: result.action === "accept" ? "confirm=false" : result.action };
-  } catch {
     return { confirmed: true };
   }
 }
@@ -159,16 +222,11 @@ export function registerSearchTool(
 ): void {
   const schema = overrides.schema ?? SearchSchema;
   const title = overrides.title ?? `Rechercher des ${opts.entityNamePlural}`;
-  const description =
-    overrides.description ??
-    `Recherche des ${opts.entityNamePlural} dans BoondManager par mots-clés avec pagination.
-
-Args:
-  - keywords (string, optional): Termes de recherche (nom, email, compétences...)
-  - page (number): Numéro de page (défaut: 1)
-  - pageSize (number): Résultats par page (défaut: 20, max: 100)
-
-Returns: Liste des ${opts.entityNamePlural} correspondants avec leur ID, nom et détails principaux.`;
+  // The pagination figures used to be typed by hand here and said
+  // "défaut: 20, max: 100" against a schema enforcing DEFAULT_PAGE_SIZE/
+  // MAX_PAGE_SIZE (30/500) — a contradiction shipped to every domain using the
+  // default. They now come from `constants.ts` via the builder.
+  const description = overrides.description ?? defaultSearchDescription(opts);
 
   server.registerTool(
     `${opts.prefix}_search`,
@@ -184,12 +242,14 @@ Returns: Liste des ${opts.entityNamePlural} correspondants avec leur ID, nom et 
         openWorldHint: true,
       },
     },
-    async (params: unknown) => {
+    async (params: unknown, extra: unknown) => {
       const p = params as SearchInput & { fields?: string[] };
       const query = buildSearchQuery(p);
       // apiSearch respects BoondManager's per-route maxResults ceiling,
-      // chunking large requests transparently (see ROUTE_MAX_RESULTS).
-      const response = await apiSearch(opts.apiPath, query);
+      // chunking large requests transparently (see ROUTE_MAX_RESULTS). The
+      // reporter is a no-op unless the client sent a progressToken, and
+      // apiSearch only uses it on the chunked path.
+      const response = await apiSearch(opts.apiPath, query, progressReporterFrom(extra));
       const text = formatListResponse(response, opts.entityName, p.fields);
       return {
         content: [{ type: "text" as const, text }],
@@ -213,17 +273,7 @@ interface GetToolOverrides {
 export function registerGetTool(server: McpServer, opts: CrudToolOptions, overrides: GetToolOverrides = {}): void {
   const withTab = overrides.withTab ?? true;
   const title = overrides.title ?? `Détails d'un(e) ${opts.entityName}`;
-  const description =
-    overrides.description ??
-    (withTab
-      ? `Récupère les informations détaillées d'un(e) ${opts.entityName} par son ID. Optionnellement un onglet spécifique (information, technical, financial, actions, contracts, documents).
-
-Args:
-  - id (string): Identifiant unique du/de la ${opts.entityName}
-  - tab (string, optional): Onglet spécifique à récupérer
-
-Returns: Données JSON complètes de l'entité.`
-      : `Récupère les informations détaillées d'un(e) ${opts.entityName} par son ID.`);
+  const description = overrides.description ?? defaultGetDescription({ ...opts, withTab });
 
   server.registerTool(
     `${opts.prefix}_get`,
@@ -250,19 +300,23 @@ Returns: Données JSON complètes de l'entité.`
   );
 }
 
+interface CreateToolOverrides {
+  title?: string;
+  description?: string;
+}
+
 export function registerCreateTool(
   server: McpServer,
   opts: CrudToolOptions,
   schema: z.ZodType,
-  buildBody: (params: Record<string, unknown>) => unknown
+  buildBody: (params: Record<string, unknown>) => unknown,
+  overrides: CreateToolOverrides = {}
 ): void {
   server.registerTool(
     `${opts.prefix}_create`,
     {
-      title: `Créer un(e) ${opts.entityName}`,
-      description: `Crée un(e) nouvel(le) ${opts.entityName} dans BoondManager.
-
-Returns: Données du/de la ${opts.entityName} créé(e) avec son ID.`,
+      title: overrides.title ?? `Créer un(e) ${opts.entityName}`,
+      description: overrides.description ?? defaultCreateDescription(opts),
       inputSchema: schema,
       outputSchema: MutationOutputSchema,
       annotations: {
@@ -298,6 +352,9 @@ interface UpdateToolOverrides {
    * only accept updates on their `/information` sub-resource and return 405 on
    * PATCH/PUT against the base resource (see issue #124). */
   pathSuffix?: string;
+  title?: string;
+  /** Overrides the composed default (see `description-builders.ts`). */
+  description?: string;
 }
 
 export function registerUpdateTool(
@@ -312,10 +369,8 @@ export function registerUpdateTool(
   server.registerTool(
     `${opts.prefix}_update`,
     {
-      title: `Modifier un(e) ${opts.entityName}`,
-      description: `Met à jour un(e) ${opts.entityName} existant(e) dans BoondManager. Seuls les champs fournis sont modifiés.
-
-Returns: Données mises à jour du/de la ${opts.entityName}.`,
+      title: overrides.title ?? `Modifier un(e) ${opts.entityName}`,
+      description: overrides.description ?? defaultUpdateDescription(opts),
       inputSchema: schema,
       outputSchema: MutationOutputSchema,
       annotations: {
@@ -357,12 +412,7 @@ export function registerDeleteTool(
     `${opts.prefix}_delete`,
     {
       title: overrides.title ?? `Supprimer un(e) ${opts.entityName}`,
-      description:
-        overrides.description ??
-        `Supprime un(e) ${opts.entityName} de BoondManager. ⚠️ Action irréversible. Si le client MCP supporte l'élicitation, une confirmation est demandée à l'utilisateur avant la suppression.
-
-Args:
-  - id (string): Identifiant de l'entité à supprimer`,
+      description: overrides.description ?? defaultDeleteDescription(opts),
       inputSchema: IdSchema,
       outputSchema: DeleteOutputSchema,
       annotations: {

@@ -1,7 +1,8 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { apiDownload, apiUploadForm, formatDetailResponse } from "../services/boond-client.js";
-import { IdSchema, DocumentCreateSchema } from "../schemas/index.js";
-import type { IdInput, DocumentCreateInput } from "../schemas/index.js";
+import { progressReporterFrom } from "../services/progress.js";
+import { DocumentIdSchema, DocumentCreateSchema } from "../schemas/index.js";
+import type { DocumentIdInput, DocumentCreateInput } from "../schemas/index.js";
 import { MAX_DOCUMENT_BYTES, CHARACTER_LIMIT } from "../constants.js";
 import { registerDeleteTool, MutationOutputSchema } from "./crud-factory.js";
 
@@ -18,13 +19,13 @@ export function registerDocumentTools(server: McpServer): void {
       title: "Télécharger un document",
       description: `Télécharge le contenu d'un document BoondManager (CV de candidat/ressource, justificatif, contrat, facture...) par son ID.
 
-Où trouver les IDs de documents : dans les onglets des entités — ex. boond_candidates_information expose les relations 'resumes' (CV) et 'files' (dossier administratif).
+Où trouver les IDs de documents : dans les onglets des entités — ex. boond_candidates_information expose les relations 'resumes' (CV) et 'files' (dossier administratif). ⚠️ Reprendre l'ID **tel quel**, suffixe compris (ex. '123_resume') : un ID tronqué à sa partie numérique ne désigne aucun document.
 
 Le contenu est retourné en ressource MCP embarquée (base64 pour les binaires type PDF/DOCX, texte brut pour les fichiers texte). Taille max: ${Math.round(MAX_DOCUMENT_BYTES / 1024 / 1024)} Mo — à n'utiliser que lorsque le contenu du fichier est réellement nécessaire (un CV en base64 occupe beaucoup de contexte).
 
-Args:
-  - id (string): Identifiant du document`,
-      inputSchema: IdSchema,
+Returns : le fichier en ressource MCP embarquée — \`blob\` base64 pour un binaire, \`text\` pour un mime texte.
+Un ID inconnu est rejeté explicitement plutôt que de renvoyer la page d'accueil BoondManager, que l'API sert en HTTP 200 à la place d'un 404.`,
+      inputSchema: DocumentIdSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -32,8 +33,10 @@ Args:
         openWorldHint: false,
       },
     },
-    async (params: IdInput) => {
-      const doc = await apiDownload(`/documents/${params.id}`);
+    async (params: DocumentIdInput, extra: unknown) => {
+      // Byte-level progress, but only when the client asked for it and the
+      // response announces a Content-Length (see readDownloadBody).
+      const doc = await apiDownload(`/documents/${params.id}`, progressReporterFrom(extra));
       const uri = `boond://documents/${params.id}`;
       const name = doc.filename ?? `document-${params.id}`;
 
@@ -129,7 +132,11 @@ Returns: Métadonnées du document créé (ID).`,
     { entityName: "document", entityNamePlural: "documents", apiPath: "/documents", prefix: "boond_documents" },
     {
       title: "Supprimer un document",
-      description: `Supprime un document de BoondManager. ⚠️ Action irréversible. Si le client MCP supporte l'élicitation, une confirmation est demandée avant la suppression.`,
+      description: `Supprime définitivement un document (CV, justificatif, pièce jointe) de BoondManager.
+
+⚠️ Irréversible, sans corbeille côté API. Si le client MCP annonce la capacité \`elicitation\`, une confirmation est demandée à l'utilisateur final et un refus annule l'appel.
+
+Returns : \`{ id, deleted, reason? }\` — vérifier \`deleted\`, qui vaut \`false\` en cas de refus utilisateur.`,
     }
   );
 }

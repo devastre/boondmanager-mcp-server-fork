@@ -7,6 +7,8 @@ import {
   formatListResponse,
   formatDetailResponse,
 } from "../services/boond-client.js";
+import { progressReporterFrom } from "../services/progress.js";
+import { defaultGetDescription } from "./description-builders.js";
 
 export function registerValidationTools(server: McpServer): void {
   server.registerTool(
@@ -34,11 +36,11 @@ Returns: Liste des validations correspondantes.`,
         openWorldHint: true,
       },
     },
-    async (params) => {
+    async (params, extra: unknown) => {
       const query = buildSearchQuery(params);
-      const response = await apiSearch("/validations", query);
+      const response = await apiSearch("/validations", query, progressReporterFrom(extra));
       return {
-        content: [{ type: "text" as const, text: formatListResponse(response, "validation") }],
+        content: [{ type: "text" as const, text: formatListResponse(response, "validation", params.fields) }],
       };
     }
   );
@@ -47,7 +49,10 @@ Returns: Liste des validations correspondantes.`,
     "boond_validations_get",
     {
       title: "Détails d'une validation",
-      description: `Récupère les informations détaillées d'une validation par son ID.`,
+      description: defaultGetDescription({
+        ...{ entityName: "validation", entityNamePlural: "validations", prefix: "boond_validations" },
+        withTab: false,
+      }),
       inputSchema: IdSchema,
       annotations: {
         readOnlyHint: true,

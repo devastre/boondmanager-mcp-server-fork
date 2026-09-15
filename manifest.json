@@ -2,8 +2,8 @@
   "manifest_version": "0.3",
   "name": "boondmanager-mcp-server",
   "display_name": "BoondManager MCP Server",
-  "version": "2.8.1",
-  "description": "MCP Server for BoondManager API - 180 tools, 11 prompts, 22 resources (ERP/CRM)",
+  "version": "2.15.0",
+  "description": "MCP Server for BoondManager API - 182 tools, 12 prompts, 22 resources (ERP/CRM)",
   "author": {
     "name": "Frédéric Auguste",
     "url": "https://github.com/fauguste/boondmanager-mcp-server"
@@ -30,6 +30,7 @@
         "BOOND_API_TOKEN": "${user_config.api_token}",
         "BOOND_USER": "${user_config.user}",
         "BOOND_PASSWORD": "${user_config.password}",
+        "BOOND_MCP_PROFILE": "${user_config.mcp_profile}",
         "BOOND_MCP_DOMAINS": "${user_config.mcp_domains}",
         "BOOND_MCP_EXCLUDE_DOMAINS": "${user_config.mcp_exclude_domains}",
         "BOOND_MCP_OPERATIONS": "${user_config.mcp_operations}",
@@ -88,6 +89,12 @@
       "sensitive": true,
       "required": false
     },
+    "mcp_profile": {
+      "type": "string",
+      "title": "Restriction : profil d'accès",
+      "description": "Profil préconfiguré parmi recruiting, sales, finance, delivery, admin (plusieurs = séparés par des virgules, union). Raccourci pour ne pas lister les domaines un par un. Ignoré si 'domaines autorisés' est renseigné. Voir docs/access-control.md.",
+      "required": false
+    },
     "mcp_domains": {
       "type": "string",
       "title": "Restriction : domaines autorisés",
@@ -133,7 +140,7 @@
   "compatibility": {
     "platforms": ["darwin", "win32", "linux"],
     "runtimes": {
-      "node": ">=20.0.0"
+      "node": ">=22.0.0"
     }
   }
 }

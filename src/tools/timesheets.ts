@@ -2,10 +2,12 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ResourceTimesheetSchema, TimesheetSearchSchema, TimesheetGetSchema } from "../schemas/index.js";
 import type { ResourceTimesheetInput, TimesheetSearchInput, TimesheetGetInput } from "../schemas/index.js";
 import { apiRequest, apiSearch, buildSearchQuery, formatDetailResponse } from "../services/boond-client.js";
+import { progressReporterFrom } from "../services/progress.js";
 import { buildJsonApiBody } from "./crud-factory.js";
 import { CHARACTER_LIMIT } from "../constants.js";
 import type { JsonApiResponse } from "../types.js";
 import { z } from "zod";
+import { composeDescription } from "./description-builders.js";
 
 const TimesheetCreateSchema = z
   .object({
@@ -63,7 +65,17 @@ export function registerTimesheetTools(server: McpServer): void {
     "boond_timesheets_create",
     {
       title: "Créer une feuille de temps",
-      description: "Crée une feuille de temps mensuelle liée à une ressource.",
+      description: composeDescription({
+        purpose: "Crée la feuille de temps (CRA) d'un mois pour une ressource.",
+        when: "pour ouvrir le CRA d'un couple (ressource, mois) qui n'existe pas encore.",
+        instead:
+          "`boond_timesheets_search` d'abord : l'API ne déduplique pas, et deux CRA peuvent coexister sur le même mois.",
+        behaviour: [
+          "`term` est le mois au format `YYYY-MM` — un CRA couvre un mois entier, pas une journée.",
+          "Écriture non idempotente.",
+        ],
+        returns: "confirmation et fiche du CRA créé.",
+      }),
       inputSchema: TimesheetCreateSchema,
       annotations: {
         readOnlyHint: false,
@@ -151,9 +163,9 @@ Returns: Liste des feuilles de temps correspondantes.`,
         openWorldHint: true,
       },
     },
-    async (params: TimesheetSearchInput) => {
+    async (params: TimesheetSearchInput, extra: unknown) => {
       const query = buildSearchQuery(params);
-      const response = await apiSearch("/times-reports", query);
+      const response = await apiSearch("/times-reports", query, progressReporterFrom(extra));
       const text = formatTimesheetSummary(response);
       return {
         content: [{ type: "text" as const, text }],

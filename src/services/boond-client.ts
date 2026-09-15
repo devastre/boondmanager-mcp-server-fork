@@ -14,7 +14,8 @@ import {
 } from "../constants.js";
 import type { BoondAuthProvider, BoondConfig, JsonApiResource, JsonApiResponse, SearchParams } from "../types.js";
 import { TokenBucket } from "./rate-limiter.js";
-import { oauthContext, hybridContext } from "./oauth.js";
+import { oauthContext } from "./oauth.js";
+import type { ProgressReporter } from "./progress.js";
 
 let config: BoondConfig | null = null;
 
@@ -68,10 +69,25 @@ export function buildJwt(
   return `${header}.${payload}.${signature}`;
 }
 
-/** Return the env value if it is a real user-supplied value, or undefined otherwise. */
+/**
+ * Return the env value if it is a real user-supplied value, or undefined otherwise.
+ *
+ * "Real" excludes three things a config form can produce for an option the user
+ * left alone — and the MCPB extension and the Claude Code plugin both build
+ * their env block by substituting `${user_config.*}` into every var, so all
+ * fourteen are always *defined*:
+ *
+ *  - `""` — an untouched optional field;
+ *  - whitespace only — a field that got a stray space or a pasted newline
+ *    (`BOOND_BASE_URL=" "` would otherwise become the request base URL);
+ *  - `"${…}"` — a placeholder no host resolved.
+ *
+ * All three must read as "not configured" so the defaults apply. Same rule as
+ * `readEnv` in `config/access-policy.ts` and `config/dictionary-overrides.ts`.
+ */
 function envOrUndefined(key: string): string | undefined {
   const v = process.env[key];
-  if (!v || v.startsWith("${")) return undefined;
+  if (!v || v.startsWith("${") || v.trim().length === 0) return undefined;
   return v;
 }
 
@@ -734,13 +750,65 @@ export interface DownloadedDocument {
   filename?: string;
 }
 
+/** Human-readable byte count for progress messages (same units as the tool output). */
+function formatBytes(bytes: number): string {
+  return bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)} Mo` : `${Math.round(bytes / 1024)} Ko`;
+}
+
+/** Progress steps emitted while streaming a download (≈ every 10 %). */
+const DOWNLOAD_PROGRESS_STEPS = 10;
+
+/**
+ * Read a download body, reporting bytes received as it goes.
+ *
+ * The streaming path only runs when someone is actually listening **and** the
+ * response announced a `Content-Length` — without a total there is nothing
+ * meaningful to report, and buffering through `arrayBuffer()` is both simpler
+ * and faster. So the default path is byte-for-byte the previous behaviour.
+ */
+async function readDownloadBody(response: Response, onProgress?: ProgressReporter): Promise<Buffer> {
+  const totalBytes = Number(response.headers.get("content-length"));
+  const body = response.body;
+  if (!onProgress?.enabled || !body || !Number.isFinite(totalBytes) || totalBytes <= 0) {
+    return Buffer.from(await response.arrayBuffer());
+  }
+
+  const reader = body.getReader();
+  const step = Math.max(1, Math.floor(totalBytes / DOWNLOAD_PROGRESS_STEPS));
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  let reported = 0;
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    chunks.push(value);
+    received += value.byteLength;
+    // Throttled to ~10 notifications: a 5 MiB file arrives in ~80 network
+    // chunks, and one notification each would be its own kind of flood.
+    if (received - reported >= step) {
+      reported = received;
+      onProgress(received, totalBytes, `Téléchargement — ${formatBytes(received)} / ${formatBytes(totalBytes)}`);
+    }
+  }
+
+  if (received > reported) {
+    onProgress(received, totalBytes, `Téléchargement terminé — ${formatBytes(received)}`);
+  }
+  return Buffer.concat(chunks);
+}
+
 /**
  * Download a binary payload (documents, justificatifs…) from the BoondManager
  * API. Same auth/safety/rate-limit plumbing as `apiRequest`, but the body is
  * returned raw instead of being parsed as JSON:API. Single attempt: document
  * downloads are interactive one-offs, not worth a retry loop.
+ *
+ * `onProgress` reports bytes received when the client asked for progress and
+ * the response carries a `Content-Length`; otherwise nothing is emitted.
  */
-export async function apiDownload(path: string): Promise<DownloadedDocument> {
+export async function apiDownload(path: string, onProgress?: ProgressReporter): Promise<DownloadedDocument> {
   const { baseUrl, auth } = getConfig();
   const url = resolveApiUrl(baseUrl, path);
 
@@ -775,12 +843,30 @@ export async function apiDownload(path: string): Promise<DownloadedDocument> {
     throw new Error(formatApiError(response.status, response.statusText, "GET", path, errorText));
   }
 
-  const data = Buffer.from(await response.arrayBuffer());
-  return {
-    data,
-    contentType: response.headers.get("content-type")?.split(";")[0].trim() || "application/octet-stream",
-    filename: parseContentDispositionFilename(response.headers.get("content-disposition")),
-  };
+  const contentType = response.headers.get("content-type")?.split(";")[0].trim() || "application/octet-stream";
+  const filename = parseContentDispositionFilename(response.headers.get("content-disposition"));
+
+  // BoondManager only answers 404 on an unknown document when the request asks
+  // for JSON. With the `Accept: */*` this function sends, it serves the
+  // application shell instead — HTTP 200, `text/html`, ~9 KB — which the caller
+  // would happily surface as the document's text content. A truncated id then
+  // looks like a corrupted file rather than a wrong id, so refuse the shell
+  // here. An HTML *document* is still downloadable: a real file download
+  // carries a `Content-Disposition` filename, the shell doesn't.
+  if (contentType === "text/html" && !filename) {
+    throw new Error(
+      [
+        "BoondManager returned an HTML page instead of a document (HTTP 200, text/html).",
+        `Endpoint: GET ${path}`,
+        "Hint: The document id is most likely wrong or truncated. Entity relations expose suffixed ids " +
+          "(e.g. `123_resume`, `123_file`) — pass the id verbatim, suffix included. BoondManager serves its " +
+          "application shell for an unknown /documents/<id> instead of a 404.",
+      ].join("\n")
+    );
+  }
+
+  const data = await readDownloadBody(response, onProgress);
+  return { data, contentType, filename };
 }
 
 /**
@@ -859,8 +945,18 @@ export function buildSearchQuery(params: SearchParams): Record<string, QueryValu
  * The chunk count is bounded by `ceil((offset + requested) / cap)`, so there is
  * no unbounded loop; the loop also stops early once a page comes back short
  * (end of the result set on the server).
+ *
+ * `onProgress` (optional, last position — no existing caller had to change) is
+ * invoked **only on the chunked path**: one step per BoondManager page. The
+ * fast path stays silent on purpose — a single API call has nothing to report
+ * and a "1/1" notification would be pure noise. The reporter is a no-op unless
+ * the client sent a `progressToken` (see `services/progress.ts`).
  */
-export async function apiSearch(path: string, query: Record<string, QueryValue>): Promise<JsonApiResponse> {
+export async function apiSearch(
+  path: string,
+  query: Record<string, QueryValue>,
+  onProgress?: ProgressReporter
+): Promise<JsonApiResponse> {
   const cap = ROUTE_MAX_RESULTS[path] ?? DEFAULT_MAX_RESULTS;
   const requested = typeof query["maxResults"] === "number" ? query["maxResults"] : DEFAULT_PAGE_SIZE;
   const page = typeof query["page"] === "number" ? query["page"] : 1;
@@ -879,6 +975,10 @@ export async function apiSearch(path: string, query: Record<string, QueryValue>)
 
   const collected: JsonApiResource[] = [];
   let meta: JsonApiResponse["meta"];
+  // Upper bound of the loop, and the `total` advertised to the client. It stays
+  // constant across the notifications of one call, as the spec requires.
+  const totalChunks = Math.ceil(needed / cap);
+  let fetchedChunks = 0;
 
   for (let i = 0; collected.length < needed; i++) {
     const chunkQuery: Record<string, QueryValue> = { ...query, page: firstBoondPage + i, maxResults: cap };
@@ -886,12 +986,194 @@ export async function apiSearch(path: string, query: Record<string, QueryValue>)
     if (meta === undefined) meta = response.meta;
     const chunk = Array.isArray(response.data) ? response.data : response.data ? [response.data] : [];
     collected.push(...chunk);
+    fetchedChunks = i + 1;
+    onProgress?.(fetchedChunks, totalChunks, `Récupération ${path} — page ${fetchedChunks}/${totalChunks}`);
     // A short page means there is no more data on the server — stop early.
     if (chunk.length < cap) break;
   }
 
   const data = collected.slice(offsetInFirstChunk, offsetInFirstChunk + requested);
+  // Early stop (result set exhausted): close the bar rather than leaving the
+  // client at 2/5 forever. Skipped when the last page already reported `total`,
+  // which would repeat a value instead of increasing it.
+  if (fetchedChunks < totalChunks) {
+    onProgress?.(totalChunks, totalChunks, `Récupération ${path} — terminé (${data.length} résultat(s))`);
+  }
   return meta !== undefined ? { data, meta } : { data };
+}
+
+/**
+ * Business identifiers used as a last resort when a list row has no
+ * human-readable identity (no name, no title, no dictionary `value`).
+ *
+ * Transactional endpoints (`/invoices`, `/orders`, `/actions`,
+ * `/deliveries-groupments`, `/projects`…) key their rows on a reference, a
+ * number or a date rather than on a name, so the standard summary rendered
+ * them as a bare `[order #1234] | Statut: 1` — a line the model cannot act on
+ * without a follow-up `_get` per row.
+ *
+ * These are deliberately NOT appended unconditionally: `/resources` and
+ * `/opportunities` also carry `reference` and amount attributes, and their
+ * rows already read well (name, title). Enriching them too would only inflate
+ * every line. See `hasIdentity` in formatEntitySummary.
+ */
+const AMOUNT_FALLBACK_FIELDS: ReadonlyArray<readonly [string, string]> = [
+  ["turnoverInvoicedExcludingTax", "CA facturé HT"],
+  ["turnoverOrderedExcludingTax", "CA commandé HT"],
+  ["turnoverSimulatedExcludingTax", "CA simulé HT"],
+  ["averageDailyPriceExcludingTax", "TJM HT"],
+];
+
+/** Max amount entries appended to a fallback line, to keep it scannable. */
+const MAX_FALLBACK_AMOUNTS = 2;
+
+/** Max length (in code points) of the `text` excerpt used to identify an action. */
+const MAX_TEXT_EXCERPT = 80;
+
+/**
+ * HTML comments, then element tags. The tag pattern requires a tag name right
+ * after the `<` (or `</`), so free text such as
+ * `Relancer si < 3 jours > sinon cloturer` survives intact — a naive
+ * `/<[^>]*>/` swallowed everything between the two operators. Quoted attribute
+ * values are matched explicitly so a `>` inside one (`<a href="a>b">`) doesn't
+ * end the tag early and leak `b">` into the excerpt. The alternatives are
+ * mutually exclusive on their first character, so there is no backtracking
+ * blow-up on unterminated input.
+ */
+const HTML_COMMENT_RE = /<!--[\s\S]*?-->/g;
+const HTML_TAG_RE = /<\/?[a-zA-Z][a-zA-Z0-9:._-]*(?:\s+(?:"[^"]*"|'[^']*'|[^"'<>])*)?\/?>/g;
+
+/** Entities actually seen in BoondManager notes (WYSIWYG output + French text). */
+const NAMED_ENTITIES: Readonly<Record<string, string>> = {
+  amp: "&",
+  lt: "<",
+  gt: ">",
+  quot: '"',
+  apos: "'",
+  nbsp: " ",
+  hellip: "…",
+  agrave: "à",
+  acirc: "â",
+  ccedil: "ç",
+  eacute: "é",
+  egrave: "è",
+  ecirc: "ê",
+  euml: "ë",
+  icirc: "î",
+  iuml: "ï",
+  ocirc: "ô",
+  ugrave: "ù",
+  ucirc: "û",
+  uuml: "ü",
+  laquo: "«",
+  raquo: "»",
+  rsquo: "’",
+  lsquo: "‘",
+  ldquo: "“",
+  rdquo: "”",
+  deg: "°",
+  euro: "€",
+  ndash: "–",
+  mdash: "—",
+};
+
+/** Decodes numeric and common named entities so the excerpt reads as text, not as markup. */
+function decodeHtmlEntities(input: string): string {
+  return input.replace(/&(#[0-9]+|#[xX][0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]*);/g, (match, body: string) => {
+    if (body.startsWith("#")) {
+      const hex = body[1] === "x" || body[1] === "X";
+      const code = Number.parseInt(hex ? body.slice(2) : body.slice(1), hex ? 16 : 10);
+      // Surrogate code points are rejected on purpose: decoding `&#55296;`
+      // would inject the very unpaired surrogate the excerpt guards against.
+      if (!Number.isInteger(code) || code <= 0 || code > 0x10ffff) return match;
+      if (code >= 0xd800 && code <= 0xdfff) return match;
+      return String.fromCodePoint(code);
+    }
+    return NAMED_ENTITIES[body.toLowerCase()] ?? match;
+  });
+}
+
+/**
+ * Renders BoondManager's HTML note fields (`/actions`.text is a `<div>…</div>`)
+ * as a short single-line excerpt. Only strings are excerpted — `text: null` and
+ * nested objects are skipped by the caller rather than printed as `null` /
+ * `[object Object]`.
+ *
+ * Truncation runs on code points (`Array.from`), never on UTF-16 code units, so
+ * an emoji sitting on the boundary can't be cut into an unpaired surrogate.
+ */
+function textExcerpt(raw: string): string | undefined {
+  const stripped = decodeHtmlEntities(raw.replace(HTML_COMMENT_RE, " ").replace(HTML_TAG_RE, " "))
+    .replace(/\s+/g, " ")
+    .trim();
+  if (stripped === "") return undefined;
+  const chars = Array.from(stripped);
+  return chars.length > MAX_TEXT_EXCERPT ? `${chars.slice(0, MAX_TEXT_EXCERPT).join("")}…` : stripped;
+}
+
+/**
+ * Single rendering rule for a raw JSON:API attribute value, shared by the
+ * fallback summary and the `fields` projection — some Boond amounts come back
+ * as `{ amount, currency }` objects, and the two paths used to disagree
+ * (`[object Object]` on one side, JSON on the other).
+ */
+function renderAttributeValue(value: unknown): string {
+  return value === null || typeof value === "object" ? JSON.stringify(value) : String(value);
+}
+
+/**
+ * A row is considered to name itself through `value` only when that value is a
+ * non-empty string once rendered. `value: null` / `value: ""` used to both
+ * print a bogus token *and* suppress the business-identifier fallback.
+ */
+function hasValueIdentity(value: unknown): boolean {
+  return value !== undefined && value !== null && renderAttributeValue(value) !== "";
+}
+
+/**
+ * Secondary identifiers for rows that have no name/title/value. Order is
+ * chosen so the most identifying token comes first (number, then reference,
+ * then when it happened, then how much).
+ */
+function fallbackIdentityParts(attrs: Record<string, unknown>): string[] {
+  const parts: string[] = [];
+
+  if (attrs.number) parts.push(`N°: ${attrs.number}`);
+  if (attrs.reference) parts.push(`Réf: ${attrs.reference}`);
+
+  if (attrs.date) {
+    parts.push(`Date: ${attrs.date}`);
+  } else if (attrs.startDate && attrs.endDate) {
+    parts.push(`Du ${attrs.startDate} au ${attrs.endDate}`);
+  } else if (attrs.startDate) {
+    parts.push(`Début: ${attrs.startDate}`);
+  } else if (attrs.endDate) {
+    parts.push(`Fin: ${attrs.endDate}`);
+  }
+
+  let amounts = 0;
+  for (const [field, label] of AMOUNT_FALLBACK_FIELDS) {
+    if (amounts >= MAX_FALLBACK_AMOUNTS) break;
+    const value = attrs[field];
+    // 0 is meaningful here (an order with no turnover yet), so only
+    // undefined/null are skipped.
+    if (value === undefined || value === null) continue;
+    parts.push(`${label}: ${renderAttributeValue(value)}`);
+    amounts++;
+  }
+
+  // `typeOf` is an integer resolved through boond://dictionary/typeOf/* — on
+  // its own it is weak, but on an action it is often the only discriminator.
+  if (attrs.typeOf !== undefined && attrs.typeOf !== null) parts.push(`Type: ${attrs.typeOf}`);
+
+  // End-user-authored free text: labelled and quoted so the model reads it as
+  // a data field of the row and not as server-authored instructions.
+  if (typeof attrs.text === "string") {
+    const excerpt = textExcerpt(attrs.text);
+    if (excerpt !== undefined) parts.push(`Note: "${excerpt}"`);
+  }
+
+  return parts;
 }
 
 export function formatEntitySummary(entity: unknown): string {
@@ -921,9 +1203,10 @@ export function formatEntitySummary(entity: unknown): string {
     parts.push(`${attrs.firstName || ""} ${attrs.lastName || ""}`.trim());
   }
   if (attrs.name) parts.push(String(attrs.name));
-  // `value` covers the `/calendars` and dictionary-style payloads.
-  if (!attrs.firstName && !attrs.lastName && !attrs.name && attrs.value !== undefined) {
-    parts.push(String(attrs.value));
+  // `value` covers the `/calendars` and dictionary-style payloads. `0` is a
+  // legitimate label there, so only null/undefined/"" are skipped.
+  if (!attrs.firstName && !attrs.lastName && !attrs.name && hasValueIdentity(attrs.value)) {
+    parts.push(renderAttributeValue(attrs.value));
   }
   if (attrs.email1) parts.push(`Email: ${attrs.email1}`);
   if (attrs.phone1) parts.push(`Tel: ${attrs.phone1}`);
@@ -931,6 +1214,19 @@ export function formatEntitySummary(entity: unknown): string {
   if (attrs.state !== undefined) parts.push(`Statut: ${attrs.state}`);
   if (attrs.title) parts.push(`Titre: ${attrs.title}`);
   if (attrs.iso !== undefined && String(attrs.iso) !== id) parts.push(`ISO: ${attrs.iso}`);
+
+  // Rows that named themselves are already useful — leave them untouched.
+  // Only the ones reduced to `[type #id]` (+ maybe a status integer) get the
+  // business identifiers appended.
+  const hasIdentity =
+    Boolean(attrs.firstName) ||
+    Boolean(attrs.lastName) ||
+    Boolean(attrs.name) ||
+    Boolean(attrs.title) ||
+    hasValueIdentity(attrs.value);
+  if (!hasIdentity) {
+    parts.push(...fallbackIdentityParts(attrs));
+  }
 
   return parts.join(" | ");
 }
@@ -944,13 +1240,15 @@ export function formatEntitySummary(entity: unknown): string {
 function formatProjectedSummary(entity: unknown, fields: string[]): string {
   const e = (entity ?? {}) as Record<string, unknown>;
   const attrs = (e.attributes ?? e) as Record<string, unknown>;
-  const id = e.id !== undefined ? String(e.id) : "?";
-  const parts: string[] = [`[#${id}]`];
+  // Reference endpoints return flat rows keyed on something else than `id`
+  // (`/calendars` keys countries on `iso`), so a missing id renders as the same
+  // `[item]` token the standard summary uses — not as a `[#?]` that reads like
+  // a formatting bug.
+  const parts: string[] = [e.id !== undefined ? `[#${String(e.id)}]` : "[item]"];
   for (const field of fields) {
     const value = attrs[field];
     if (value === undefined) continue;
-    const rendered = value === null || typeof value === "object" ? JSON.stringify(value) : String(value);
-    parts.push(`${field}: ${rendered}`);
+    parts.push(`${field}: ${renderAttributeValue(value)}`);
   }
   return parts.join(" | ");
 }
@@ -965,17 +1263,33 @@ export function formatListResponse(response: JsonApiResponse, entityType: string
 
   const projected = fields !== undefined && fields.length > 0;
   const lines = data.map((item) => (projected ? formatProjectedSummary(item, fields) : formatEntitySummary(item)));
-  let result = lines.join("\n");
+  const header = total !== undefined ? `Total: ${total} ${entityType}(s)\n\n` : "";
+  const body = lines.join("\n");
 
-  if (total !== undefined) {
-    result = `Total: ${total} ${entityType}(s)\n\n${result}`;
+  if (header.length + body.length <= CHARACTER_LIMIT) return header + body;
+
+  // Cut on line boundaries and say how many rows were dropped. A mid-line cut
+  // produced a half-row indistinguishable from a complete one, and the count
+  // is what tells the model to narrow the query (or use `fields`/`pageSize`)
+  // instead of trusting an implicitly complete page.
+  const notice = (shown: number) =>
+    `\n\n[Résultats tronqués : ${shown}/${lines.length} ligne(s) affichée(s) (limite de ${CHARACTER_LIMIT} caractères). ` +
+    `Affinez les filtres, réduisez pageSize, ou utilisez 'fields' pour raccourcir chaque ligne.]`;
+  const budget = CHARACTER_LIMIT - header.length - notice(lines.length).length;
+
+  const kept: string[] = [];
+  let used = 0;
+  for (const line of lines) {
+    const cost = kept.length === 0 ? line.length : line.length + 1;
+    if (used + cost > budget) break;
+    used += cost;
+    kept.push(line);
   }
 
-  if (result.length > CHARACTER_LIMIT) {
-    result = result.substring(0, CHARACTER_LIMIT) + "\n\n[Résultats tronqués...]";
-  }
+  // A single row longer than the whole budget still has to show something.
+  if (kept.length === 0) return header + body.substring(0, Math.max(budget, 0)) + notice(0);
 
-  return result;
+  return header + kept.join("\n") + notice(kept.length);
 }
 
 /**
@@ -1005,15 +1319,34 @@ export function formatTabResponse(response: JsonApiResponse): string {
   return result;
 }
 
+/**
+ * The canonical shape of a single entity as this server hands it to the model:
+ * the JSON:API resource minus the envelope noise (`links`, `meta`).
+ *
+ * Extracted from `formatDetailResponse` so the entity resource templates
+ * (`boond://candidate/{id}`) aggregate the *same* projection instead of
+ * defining a second, drifting idea of what an entity looks like. They cannot
+ * reuse `formatDetailResponse` itself: it renders one entity and truncates
+ * mid-string at `CHARACTER_LIMIT`, which on pretty-printed JSON yields an
+ * unparseable body — acceptable for a tool's text content, not for a resource
+ * whose whole point is to be read as JSON.
+ */
+export function projectEntity(
+  entity: JsonApiResource
+): Pick<JsonApiResource, "id" | "type" | "attributes" | "relationships"> {
+  return {
+    id: entity.id,
+    type: entity.type,
+    attributes: entity.attributes,
+    relationships: entity.relationships,
+  };
+}
+
 export function formatDetailResponse(response: JsonApiResponse): string {
   const entity = Array.isArray(response.data) ? response.data[0] : response.data;
   if (!entity) return "Entité non trouvée.";
 
-  const result = JSON.stringify(
-    { id: entity.id, type: entity.type, attributes: entity.attributes, relationships: entity.relationships },
-    null,
-    2
-  );
+  const result = JSON.stringify(projectEntity(entity), null, 2);
 
   if (result.length > CHARACTER_LIMIT) {
     return result.substring(0, CHARACTER_LIMIT) + "\n\n[Résultat tronqué...]";

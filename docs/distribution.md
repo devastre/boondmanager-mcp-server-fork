@@ -9,10 +9,11 @@ the reference for what gets pushed where on each release.
 
 | Channel | URL / Identifier | Sync mechanism | Frequency |
 |---|---|---|---|
-| **npm** | [`boondmanager-mcp-server`](https://www.npmjs.com/package/boondmanager-mcp-server) | `npm publish --provenance` step in `release.yml` | every `v*` tag |
+| **npm** | [`boondmanager-mcp-server`](https://www.npmjs.com/package/boondmanager-mcp-server) | `npm publish --provenance` step in `release.yml`, authenticated by **OIDC trusted publishing** (no `NPM_TOKEN`; see the secrets section of `CLAUDE.md` for the two traps that make it fail with a misleading 404) | every `v*` tag |
 | **MCP Registry** | [`io.github.fauguste/boondmanager-mcp-server`](https://registry.modelcontextprotocol.io/) | `mcp-publisher publish` in `release.yml` (GitHub OIDC) | every `v*` tag |
 | **GitHub Releases (.mcpb bundle)** | [releases page](https://github.com/fauguste/boondmanager-mcp-server/releases) | `softprops/action-gh-release@v3` in `release.yml`; body sourced from `CHANGELOG.md` | every `v*` tag |
 | **GitHub Container Registry** | `ghcr.io/fauguste/boondmanager-mcp-server` | `docker/build-push-action@v6` in `release.yml`; multi-arch (amd64+arm64), tags `:latest`, `:X`, `:X.Y`, `:X.Y.Z` | every `v*` tag |
+| **Claude Code plugin marketplace** | `/plugin marketplace add fauguste/boondmanager-mcp-server` → `boondmanager-mcp@boondmanager` | reads `.claude-plugin/marketplace.json` + `plugins/boondmanager-mcp/` from the default branch; the plugin launches `npx boondmanager-mcp-server@X.Y.Z` (stdio) | on the user's `/plugin marketplace update` |
 | **LobeHub MCP marketplace** | [fauguste-boondmanager-mcp-server](https://lobehub.com/mcp/fauguste-boondmanager-mcp-server) | mirrors the MCP Registry (auto, ~24-48 h delay) | per release |
 | **Smithery** | [smithery.ai listing](https://smithery.ai/server/@fauguste/boondmanager-mcp-server) | reads `smithery.yaml` from this repo | per push to `main` |
 | **Gemini CLI extension** | `gemini extensions install https://github.com/fauguste/boondmanager-mcp-server` | reads `gemini-extension.json` from repo root | on install (reads the default branch) |
@@ -73,6 +74,31 @@ only act if the auto-mirror hasn't picked us up.
 [mcp.so](https://mcp.so/) requests submissions through their GitHub repo
 (`chatmcp/mcp-directory`). Same pattern: one PR, then it auto-syncs.
 
+### 6. awesome-ai-plugins (community list)
+
+Requested by the list's maintainers in
+[issue #194](https://github.com/fauguste/boondmanager-mcp-server/issues/194).
+[`hashgraph-online/awesome-ai-plugins`](https://github.com/hashgraph-online/awesome-ai-plugins)
+is a cross-assistant catalogue (~340 entries) that already lists a number of
+ERP/CRM MCP servers, so the fit is real — but the invitation is mass outreach
+(the same issue title is open on 400+ repos) and the incentive it advertises is
+a dofollow backlink from `hol.org/registry/plugins`. Same shape as
+awesome-mcp-servers above: one PR, one line, no integration work.
+
+Open a PR adding the entry to the **Community Plugins → Tools & Integrations**
+section, in alphabetical order (between `Bitbucket CLI` and `Cadence Code`):
+
+```markdown
+- [BoondManager MCP Server](https://github.com/fauguste/boondmanager-mcp-server) - MCP server for the BoondManager staffing ERP/CRM exposing 182 tools, 12 prompts and 22 resources over candidates, resources, opportunities, projects, invoices and expense reports, with stdio and OAuth-protected HTTP transports.
+```
+
+**Do not add their scanner CI.** `CONTRIBUTING.md` recommends a workflow that
+installs the `plugin-scanner` PyPI package to earn a "full trust score" (a
+listing without it is accepted with a 10 % score reduction). That trades a real
+supply-chain surface — a third-party scanner executing in our CI — for a
+cosmetic badge on someone else's directory. The listing is explicitly valid
+without it, and this repo already runs CodeQL.
+
 ## Per-release verification (post-tag)
 
 After every `v*` tag is pushed and the Release workflow turns green, take 2
@@ -84,6 +110,19 @@ minutes to spot-check the distribution surface:
 4. **GHCR** — `docker pull ghcr.io/fauguste/boondmanager-mcp-server:<tag>` succeeds; `docker manifest inspect` shows both `linux/amd64` and `linux/arm64`.
 5. **LobeHub** — within ~48 h, `https://lobehub.com/mcp/fauguste-boondmanager-mcp-server` shows the new description / changelog. If not, it's safe to ignore (LobeHub re-scans on its own cadence).
 6. **Smithery** — `https://smithery.ai/server/@fauguste/boondmanager-mcp-server` reflects the latest `smithery.yaml`. Smithery refreshes on every push to `main`, not per tag.
+7. **Claude Code plugin** — `claude plugin marketplace update boondmanager` then check the entry advertises the tagged version. The refresh happens on the *user's* machine, so this is the one channel where "published" and "what users get" can disagree for as long as they don't update. The version pinned in `plugins/boondmanager-mcp/.mcp.json` only resolves once the npm publish step has landed, which is why the plugin files are bumped in the release commit and never ahead of it.
+
+## Channel boundaries (what does NOT replace what)
+
+Three formats, three audiences — none of them is redundant:
+
+- **`.mcpb`** targets Claude Desktop, bundles `dist/` and runs it with `node`.
+  Its `user_config` block is the source of truth for the configuration form.
+- **Claude Code plugin** targets the CLI/IDE, ships only two JSON files and
+  defers to the npm package. Same 14 options, generated from the `.mcpb`
+  manifest by `scripts/generate-plugin-manifest.mjs` (CI-checked for drift).
+- **MCP Registry** is the machine-readable index every other aggregator mirrors
+  (LobeHub, Glama, PulseMCP). It describes the server, it does not install it.
 
 ## Adding a new distribution channel
 

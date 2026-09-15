@@ -17,6 +17,40 @@ export const ROUTE_MAX_RESULTS: Record<string, number> = {
 };
 export const DEFAULT_MAX_RESULTS = MAX_PAGE_SIZE;
 
+// Search tools whose endpoint *ignores* `maxResults` and always returns its
+// whole table. Verified against the live API on 2026-09-09 by requesting
+// `maxResults=2` directly:
+//
+//   /poles      HTTP 200, 73 rows  (meta.totals.rows 73)
+//   /agencies   HTTP 200, 11 rows  (meta.totals.rows 11)
+//   /calendars  HTTP 200, 249 rows (no meta.totals.rows)
+//   /webhooks   HTTP 200, 3 rows   (meta.totals.rows 3)
+//
+// The server does send the parameter; BoondManager discards it on these
+// reference routes. So `pageSize` and `page` are inert there, and a description
+// promising "`pageSize` 1–500, `page` 1–100 — beyond that: rejected" would be
+// telling a model something the endpoint does not do. That is the same class of
+// defect as the hand-typed "défaut: 20, max: 100" this catalogue just removed,
+// so these tools get their own wording instead (see `parameter-disclosure.ts`).
+//
+// Keyed by tool name, not API path: the disclosure runs in the registration
+// Proxy, which sees the tool name and the schema, never the `apiPath`.
+//
+// Not an operational risk, and worth saying so: these are small reference
+// tables (3–249 rows, ~18 KB of tool result at the largest) — far under
+// CHARACTER_LIMIT. The problem is accuracy, not volume.
+//
+// Deliberately *not* extended by guesswork. `/business-units`, `/products`,
+// `/threads` and `/todolists` returned 0 rows on the tenant probed, so their
+// behaviour is unknown; a route belongs here only once it has been observed
+// returning more rows than it was asked for.
+export const TOOLS_IGNORING_PAGINATION: ReadonlySet<string> = new Set([
+  "boond_poles_search",
+  "boond_agencies_search",
+  "boond_calendars_search",
+  "boond_webhooks_search",
+]);
+
 // Cap the page number on search tools (openWorldHint) to prevent runaway
 // iterations. At 500 results/page, page 100 = 50k records — well beyond
 // typical interactive exploration. The model can refine filters instead.
@@ -27,6 +61,15 @@ export const MAX_SEARCH_PAGE = 100;
 // anything beyond this is refused with a clear message instead of silently
 // flooding the conversation.
 export const MAX_DOCUMENT_BYTES = 5 * 1024 * 1024;
+
+// Hard ceiling on the body of an entity resource template
+// (`boond://candidate/{id}`). Unlike a tool, a resource has no `pageSize` and
+// the model cannot ask for less, so the cap is enforced server-side by dropping
+// whole sections — never by truncating the text, which on pretty-printed JSON
+// would hand the client an unparseable body. Deliberately larger than
+// CHARACTER_LIMIT: that one budgets a *page of list rows* for the context
+// window, while an aggregated entity record is bigger by nature.
+export const MAX_RESOURCE_BYTES = 256 * 1024;
 
 // HTTP client defaults
 // Timeout applied to every BoondManager API request. Overridable via

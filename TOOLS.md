@@ -3,7 +3,7 @@
 > Auto-generated from the server registrations. Do not edit by hand.
 > Regenerate with `npm run docs:tools` (CI fails if this file is stale).
 
-**180 tools** across **38 domains** · **11 prompts** · **22 resources**.
+**182 tools** across **38 domains** · **12 prompts** · **22 resources** · **6 resource templates**.
 
 Hint legend: `read` (readOnlyHint), `write` (creates/updates), `delete` (destructiveHint), `idempotent` (idempotentHint), `open-world` (openWorldHint, e.g. paginated keyword search).
 
@@ -144,11 +144,12 @@ Hint legend: `read` (readOnlyHint), `write` (creates/updates), `delete` (destruc
 | `boond_documents_delete` | Supprimer un document | delete |
 | `boond_documents_get` | Télécharger un document | read · idempotent |
 
-### expenses (5)
+### expenses (6)
 
 | Tool | Title | Hints |
 |---|---|---|
 | `boond_expenses_create` | Créer un(e) note de frais | write |
+| `boond_expenses_default` | Références de saisie d'une note de frais | read · idempotent |
 | `boond_expenses_delete` | Supprimer une note de frais | delete |
 | `boond_expenses_get` | Détails d'un(e) note de frais | read · idempotent |
 | `boond_expenses_search` | Rechercher des notes de frais | read · idempotent · open-world |
@@ -194,8 +195,8 @@ Hint legend: `read` (readOnlyHint), `write` (creates/updates), `delete` (destruc
 | `boond_opportunities_delete` | Supprimer un(e) opportunité | delete |
 | `boond_opportunities_get` | Détails d'un(e) opportunité | read · idempotent |
 | `boond_opportunities_information` | Informations générales d'une opportunité | read · idempotent |
-| `boond_opportunities_positionings` | Positionnements d'une opportunité | read · idempotent |
-| `boond_opportunities_projects` | Projets liés à une opportunité | read · idempotent |
+| `boond_opportunities_positionings` | Positionnements sur une opportunité | read · idempotent |
+| `boond_opportunities_projects` | Projets issus d'une opportunité | read · idempotent |
 | `boond_opportunities_search` | Rechercher des opportunités | read · idempotent · open-world |
 | `boond_opportunities_simulation` | Simulation financière d'une opportunité | read · idempotent |
 | `boond_opportunities_update` | Modifier un(e) opportunité | write · idempotent |
@@ -258,12 +259,12 @@ Hint legend: `read` (readOnlyHint), `write` (creates/updates), `delete` (destruc
 | `boond_projects_actions` | Actions liées à un projet | read · idempotent |
 | `boond_projects_create` | Créer un(e) projet | write |
 | `boond_projects_delete` | Supprimer un(e) projet | delete |
-| `boond_projects_deliveries_groupments` | Livraisons d'un projet | read · idempotent |
+| `boond_projects_deliveries_groupments` | Livraisons et groupements d'un projet | read · idempotent |
 | `boond_projects_get` | Détails d'un(e) projet | read · idempotent |
 | `boond_projects_information` | Informations générales d'un projet | read · idempotent |
 | `boond_projects_orders` | Bons de commande d'un projet | read · idempotent |
 | `boond_projects_productivity` | Productivité d'un projet | read · idempotent |
-| `boond_projects_purchases` | Achats/sous-traitance d'un projet | read · idempotent |
+| `boond_projects_purchases` | Achats d'un projet | read · idempotent |
 | `boond_projects_search` | Rechercher des projets | read · idempotent · open-world |
 | `boond_projects_simulation` | Simulation financière d'un projet | read · idempotent |
 | `boond_projects_update` | Modifier un(e) projet | write · idempotent |
@@ -363,7 +364,7 @@ Hint legend: `read` (readOnlyHint), `write` (creates/updates), `delete` (destruc
 | `boond_webhooks_get` | Détails d'un(e) webhook | read · idempotent |
 | `boond_webhooks_search` | Rechercher des webhooks | read · idempotent · open-world |
 
-### workflow (11)
+### workflow (12)
 
 | Tool | Title | Hints |
 |---|---|---|
@@ -378,8 +379,9 @@ Hint legend: `read` (readOnlyHint), `write` (creates/updates), `delete` (destruc
 | `boond_workflow_recherche_profil_competences` | Recherche multi-source d'un profil par compétences | read · idempotent |
 | `boond_workflow_staffing_disponible` | Consultants disponibles pour un staffing | read · idempotent |
 | `boond_workflow_synthese_equipe` | Synthèse d'une équipe | read · idempotent |
+| `boond_workflow_traiter_note_de_frais` | Traiter un justificatif en note de frais | read · idempotent |
 
-## Prompts (11)
+## Prompts (12)
 
 Pre-orchestrated workflows surfaced via the MCP prompts API.
 
@@ -396,6 +398,7 @@ Pre-orchestrated workflows surfaced via the MCP prompts API.
 | `recherche_profil_competences` | Recherche multi-source d'un profil par compétences | `competences` `experience_min?` `dispo_avant?` `inclure_candidats?` `manager_id?` |
 | `staffing_disponible` | Consultants disponibles pour un staffing | `start_date` `end_date` `competences?` `manager_id?` |
 | `synthese_equipe` | Synthèse d'une équipe | `manager_id?` `periode?` |
+| `traiter_note_de_frais` | Traiter un justificatif en note de frais | `resource_id?` `project_id?` `term?` `contexte?` |
 
 ## Resources (22)
 
@@ -425,3 +428,16 @@ Reference data exposed as MCP resources.
 | `boond://dictionary/typeOf/contacts` | Types contacts |
 | `boond://dictionary/typeOf/projects` | Types projets |
 | `boond://dictionary/typeOf/resources` | Types ressources |
+
+## Resource templates (6)
+
+Parameterised resources (`resources/templates/list`). Not enumerable — read a URI directly, or let the client autocomplete the id via `completions/complete`.
+
+| URI template | Title |
+|---|---|
+| `boond://candidate/{id}` | Fiche candidat |
+| `boond://company/{id}` | Fiche société |
+| `boond://contact/{id}` | Fiche contact |
+| `boond://opportunity/{id}` | Fiche opportunité |
+| `boond://project/{id}` | Fiche projet |
+| `boond://resource/{id}` | Fiche ressource (collaborateur) |

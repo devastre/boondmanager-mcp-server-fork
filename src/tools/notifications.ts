@@ -7,6 +7,8 @@ import {
   formatListResponse,
   formatDetailResponse,
 } from "../services/boond-client.js";
+import { progressReporterFrom } from "../services/progress.js";
+import { defaultGetDescription } from "./description-builders.js";
 
 export function registerNotificationTools(server: McpServer): void {
   server.registerTool(
@@ -31,11 +33,11 @@ Returns: Liste des notifications correspondantes.`,
         openWorldHint: true,
       },
     },
-    async (params) => {
+    async (params, extra: unknown) => {
       const query = buildSearchQuery(params);
-      const response = await apiSearch("/notifications", query);
+      const response = await apiSearch("/notifications", query, progressReporterFrom(extra));
       return {
-        content: [{ type: "text" as const, text: formatListResponse(response, "notification") }],
+        content: [{ type: "text" as const, text: formatListResponse(response, "notification", params.fields) }],
       };
     }
   );
@@ -44,7 +46,10 @@ Returns: Liste des notifications correspondantes.`,
     "boond_notifications_get",
     {
       title: "Détails d'une notification",
-      description: `Récupère les informations détaillées d'une notification par son ID.`,
+      description: defaultGetDescription({
+        ...{ entityName: "notification", entityNamePlural: "notifications", prefix: "boond_notifications" },
+        withTab: false,
+      }),
       inputSchema: IdSchema,
       annotations: {
         readOnlyHint: true,
